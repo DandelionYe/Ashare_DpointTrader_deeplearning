@@ -4,13 +4,10 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Virtual env
-venv/
-.venv/
+# Office temp files
+~$*
+*.tmp
 
-# Notebook checkpoints
-.ipynb_checkpoints/
-
-# OS files
-.DS_Store
-Thumbs.db
+# Ignore generated outputs
+output/*
+!output/.gitkeep
