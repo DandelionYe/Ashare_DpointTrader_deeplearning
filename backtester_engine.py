@@ -632,8 +632,8 @@ def _build_signal_frame(
         "dp_above_buy": dpoint_aligned > buy_threshold,
         "dp_below_sell": dpoint_aligned < sell_threshold,
         # P2 修复：保留必要字段供 check_execution_feasibility 使用
-        "volume": df["volume"].astype(float),
-        "amount": df["amount"].astype(float),
+        "volume": df["volume"].astype(float) if "volume" in df.columns else pd.Series(0.0, index=df.index),
+        "amount": df["amount"].astype(float) if "amount" in df.columns else pd.Series(0.0, index=df.index),
         "suspended": df.get("suspended", False),
         "is_st": df.get("is_st", False),
         "listing_days": df.get("listing_days", 999999),
