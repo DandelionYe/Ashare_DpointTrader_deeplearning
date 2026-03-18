@@ -292,14 +292,12 @@ def check_execution_feasibility(
 
     # 5. 检查上市天数
     listing_days = row.get("listing_days", 999999)
-    if listing_days < min_listing_days:
+    if min_listing_days > 0 and listing_days < min_listing_days:
         return False, "上市天数不足"
 
-    # 6. 检查成交量（使用 amount 成交额，单位：元）
-    # P2 修复：原代码使用 volume（股数），但 min_daily_volume 参数名暗示成交额（元）
-    # 修复为使用 amount 字段，更符合流动性过滤的实际需求
-    daily_amount = row.get("amount", 0)
-    if daily_amount < min_daily_volume:
+    # 6. 检查成交量
+    daily_volume = float(row.get("volume", 0) or 0)
+    if min_daily_volume > 0 and daily_volume < min_daily_volume:
         return False, "成交量过低"
 
     return True, ""
