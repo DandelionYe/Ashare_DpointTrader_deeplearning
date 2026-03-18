@@ -82,7 +82,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        pip install mypy types-python-dateutil types-pandas
+        pip install mypy types-python-dateutil
 
     - name: Run mypy
       run: |
