@@ -1,8 +1,31 @@
 # Changelog
 
-## [Ver3.0] - 2026-03-18
+## [Ver3.0] - 2026-03-19
 
-### 🚀 Major Refactor
+### 🚀 Major Refactor - Module Naming Unification
+
+* **Unified module naming across codebase, README, CLI, and tests**
+* Refactored core module names for clarity:
+
+  * `data.py` → `data_loader.py` (Excel loader + walk-forward splits)
+  * `training.py` → `trainer.py` (random search + calibration + persistence)
+  * `evaluation.py` → `backtester.py` (backtest engine + metrics + regime analysis)
+  * `reporting.py` → `reporter.py` (Excel/JSON/HTML reporting)
+* Updated all imports in:
+
+  * `main_cli.py`
+  * `dpoint_updater.py`
+  * All test files
+* README Architecture Overview now shows flat module structure
+* Removed all legacy module references from documentation
+
+### 🧪 Test Quality Improvements
+
+* Fixed fake tests using `try: ... except: pass; assert True` pattern
+* All 110 tests now properly assert conditions
+* Smoke tests now reliably catch regressions
+
+### 📦 Previous Changes (Ver3.0 - 2026-03-18)
 
 * Refactored project structure to improve modularity and maintainability
 * Reorganized core modules:

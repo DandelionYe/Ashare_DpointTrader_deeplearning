@@ -55,23 +55,17 @@ All features in `X_t` are built exclusively from data available on or before day
 ## Architecture Overview
 
 ```
-main_cli.py  ──────────────────────────────────────────────────────►  Excel + JSON
-     │
-     ├── data_loader.py          Load & clean A-share OHLCV Excel
-     │
-     ├── trainer.py              Random search with explore/exploit rounds
-     │       ├── feature_dpoint.py   Build feature matrix X and label y
-     │       ├── models.py         sklearn models (LogReg, SGD, XGB) + PyTorch models
-     │       ├── data_loader.py    Walk-forward time-series splits
-     │       ├── backtester.py     Geometric mean equity ratio + trade penalty
-     │       └── utils.py          best_so_far.json / best_pool.json
-     │
-     ├── backtester.py           Event-driven backtest with A-share constraints
-     ├── reporter.py             Excel workbook + JSON + HTML report
-     └── utils.py                Experiment manifest & reproducibility tools
-
-dpoint_updater.py               Standalone tool: retrain on fresh data and export Dpoint
-rolling_trainer.py              Rolling retrain scheduler (expanding/rolling window)
+main_cli.py          Orchestrates the end-to-end pipeline
+data_loader.py      Load, validate, clean, and split A-share OHLCV data
+feature_dpoint.py   Build feature matrix X and label y
+models.py           sklearn + PyTorch model factory
+trainer.py          Search, CV scoring, final training, calibration
+backtester.py       Backtest engine, buy&hold baseline, risk metrics
+reporter.py         Excel / JSON / HTML reporting
+utils.py            Reproducibility, manifests, environment helpers
+dpoint_updater.py   Retrain and export fresh Dpoint
+rolling_trainer.py  Rolling or expanding retraining utility
+compare_runs.py     Compare historical run outputs
 ```
 
 ---

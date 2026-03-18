@@ -55,23 +55,17 @@ Dpoint_t = P(close_{t+1} > close_t | X_t)
 ## 系统架构
 
 ```
-main_cli.py  ──────────────────────────────────────────────────────►  Excel + JSON
-     │
-     ├── data_loader.py          加载并清洗 A 股 OHLCV Excel 数据
-     │
-     ├── trainer.py              随机搜索（探索 / 精细化 / 池采样 三模式轮次）
-     │       ├── feature_dpoint.py   构建特征矩阵 X 和标签 y
-     │       ├── models.py         sklearn 模型（LogReg、SGD、XGB）+ PyTorch 模型
-     │       ├── data_loader.py    Walk-Forward 时序切分
-     │       ├── backtester.py     几何均值净值比率 + 交易次数惩罚项
-     │       └── utils.py          best_so_far.json / best_pool.json 持久化
-     │
-     ├── backtester.py           事件驱动回测（含 A 股约束）
-     ├── reporter.py             Excel 工作簿 + JSON + HTML 报告
-     └── utils.py                实验清单与可复现性工具
-
-dpoint_updater.py               独立工具：在新数据上重训并导出 Dpoint
-rolling_trainer.py              滚动再训练调度器（扩展/滚动窗口）
+main_cli.py          端到端流程编排
+data_loader.py      加载、验证、清洗和切分 A 股 OHLCV 数据
+feature_dpoint.py   构建特征矩阵 X 和标签 y
+models.py           sklearn + PyTorch 模型工厂
+trainer.py          随机搜索、CV 评分、最终训练、概率校准
+backtester.py       回测引擎、Buy&Hold 基准、风险指标
+reporter.py         Excel / JSON / HTML 报告生成
+utils.py            可复现性、实验清单、环境信息工具
+dpoint_updater.py   重训并导出最新 Dpoint 信号
+rolling_trainer.py  滚动或扩展窗口再训练工具
+compare_runs.py     对比历史运行结果
 ```
 
 ---

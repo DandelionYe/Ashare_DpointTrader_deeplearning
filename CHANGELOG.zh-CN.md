@@ -1,8 +1,31 @@
 # 更新日志
 
-## [Ver3.0] - 2026-03-18
+## [Ver3.0] - 2026-03-19
 
-### 🚀 架构重构
+### 🚀 模块命名统一
+
+* **统一代码库、README、CLI 和测试中的模块命名**
+* 核心模块重命名以提高清晰度：
+
+  * `data.py` → `data_loader.py`（Excel 加载 + Walk-Forward 切分）
+  * `training.py` → `trainer.py`（随机搜索 + 校准 + 持久化）
+  * `evaluation.py` → `backtester.py`（回测引擎 + 指标 + 市场状态分析）
+  * `reporting.py` → `reporter.py`（Excel/JSON/HTML 报告生成）
+* 更新所有导入语句：
+
+  * `main_cli.py`
+  * `dpoint_updater.py`
+  * 所有测试文件
+* README 架构图改为平铺式模块结构
+* 从文档中移除所有旧模块引用
+
+### 🧪 测试质量改进
+
+* 修复使用 `try: ... except: pass; assert True` 模式的假测试
+* 所有 110 个测试现在都正确断言条件
+* 冒烟测试现在能够可靠捕获回归问题
+
+### 📦 之前的更改 (Ver3.0 - 2026-03-18)
 
 * 对项目整体结构进行重构，提高模块化程度和可维护性
 * 核心模块重新组织：

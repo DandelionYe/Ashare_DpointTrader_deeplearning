@@ -40,7 +40,7 @@ class TestSmokeMinimal:
         np.random.seed(42)
         n = 100
         dates = pd.date_range(start="2020-01-01", periods=n, freq="B")
-        
+
         df = pd.DataFrame({
             "date": dates,
             "close_qfq": 10 + np.cumsum(np.random.randn(n)),
@@ -49,16 +49,15 @@ class TestSmokeMinimal:
             "low_qfq": 10 + np.cumsum(np.random.randn(n)),
             "volume": np.random.uniform(1e6, 1e7, n),
             "amount": np.random.uniform(1e7, 1e8, n),
+            "turnover_rate": np.random.uniform(0.5, 5.0, n),
         })
-        
+
         feature_config = {}
-        
-        try:
-            X, y, meta = build_features_and_labels(df, feature_config)
-            assert len(X) >= 0
-        except Exception:
-            pass
-        assert True
+
+        X, y, meta = build_features_and_labels(df, feature_config)
+        assert len(X) > 0
+        assert len(y) > 0
+        assert hasattr(meta, "feature_names") or isinstance(meta, dict)
     
     def test_splitter(self):
         """Test that splitter works."""
@@ -71,16 +70,14 @@ class TestSmokeMinimal:
     
     def test_model_creation(self):
         """Test that model can be created."""
-        try:
-            config = {
-                "model_type": "LogReg",
-                "model_C": 1.0,
-            }
-            model = make_model({"model_config": config}, seed=42)
-            assert model is not None
-        except Exception:
-            pass
-        assert True
+        config = {
+            "model_type": "logreg",
+            "C": 1.0,
+            "penalty": "l2",
+            "solver": "lbfgs",
+        }
+        model = make_model({"model_config": config}, seed=42)
+        assert model is not None
     
     def test_backtest_basic(self):
         """Test that backtest runs with minimal data."""
@@ -118,7 +115,7 @@ class TestSmokeMinimal:
         np.random.seed(42)
         n = 150
         dates = pd.date_range(start="2020-01-01", periods=n, freq="B")
-        
+
         prices = 10 + np.cumsum(np.random.randn(n) * 0.5)
         df = pd.DataFrame({
             "date": dates,
@@ -128,68 +125,62 @@ class TestSmokeMinimal:
             "low_qfq": prices * 0.99,
             "volume": np.random.uniform(1e6, 1e7, n),
             "amount": np.random.uniform(1e7, 1e8, n),
+            "turnover_rate": np.random.uniform(0.5, 5.0, n),
         })
-        
-        try:
-            feature_config = {}
-            X, y, meta = build_features_and_labels(df, feature_config)
-            
-            config = {
-                "feature_config": feature_config,
-                "model_config": {"model_type": "LogReg", "model_C": 1.0},
-                "trade_config": {
-                    "initial_cash": 100000.0,
-                    "buy_threshold": 0.6,
-                    "sell_threshold": 0.4,
-                    "confirm_days": 2,
-                    "min_hold_days": 1,
-                    "max_hold_days": 10,
-                },
-            }
-            
-            dpoint, artifacts = train_final_model_and_dpoint(df, config, seed=42)
-            assert "feature_meta" in artifacts
-        except Exception as e:
-            pass
-        assert True
+
+        feature_config = {}
+        X, y, meta = build_features_and_labels(df, feature_config)
+
+        config = {
+            "feature_config": feature_config,
+            "model_config": {"model_type": "logreg", "C": 1.0, "penalty": "l2", "solver": "lbfgs"},
+            "trade_config": {
+                "initial_cash": 100000.0,
+                "buy_threshold": 0.6,
+                "sell_threshold": 0.4,
+                "confirm_days": 2,
+                "min_hold_days": 1,
+                "max_hold_days": 10,
+            },
+        }
+
+        dpoint, artifacts = train_final_model_and_dpoint(df, config, seed=42)
+        assert "feature_meta" in artifacts
     
     def test_report_generation(self, minimal_price_data, temp_output_dir):
         """Test that report generation works."""
-        try:
-            np.random.seed(42)
-            
-            dpoint = pd.Series(0.5, index=minimal_price_data.index)
-            
-            result = backtest_from_dpoint(
-                minimal_price_data,
-                dpoint,
-                buy_threshold=0.6,
-                sell_threshold=0.4,
-                confirm_days=2,
-            )
-            
-            log_notes = ["Test log note"]
-            
-            excel_path, config_path, run_id = save_run_outputs(
-                output_dir=temp_output_dir,
-                df_clean=minimal_price_data,
-                log_notes=log_notes,
-                trades=result.trades,
-                equity_curve=result.equity_curve,
-                config={
-                    "feature_config": {},
-                    "model_config": {},
-                    "trade_config": {},
-                },
-                feature_meta={"test": "meta"},
-                search_log=pd.DataFrame(),
-            )
-            
-            assert os.path.exists(excel_path)
-            assert os.path.exists(config_path)
-        except Exception as e:
-            pass
-        assert True
+        np.random.seed(42)
+
+        dpoint = pd.Series(0.5, index=minimal_price_data.index)
+
+        result = backtest_from_dpoint(
+            minimal_price_data,
+            dpoint,
+            buy_threshold=0.6,
+            sell_threshold=0.4,
+            confirm_days=2,
+        )
+
+        log_notes = ["Test log note"]
+
+        excel_path, config_path, run_id = save_run_outputs(
+            output_dir=temp_output_dir,
+            df_clean=minimal_price_data,
+            log_notes=log_notes,
+            trades=result.trades,
+            equity_curve=result.equity_curve,
+            config={
+                "feature_config": {},
+                "model_config": {},
+                "trade_config": {},
+            },
+            feature_meta={"test": "meta"},
+            search_log=pd.DataFrame(),
+        )
+
+        assert os.path.exists(excel_path)
+        assert os.path.exists(config_path)
+        assert run_id >= 1
 
 
 @pytest.mark.smoke
