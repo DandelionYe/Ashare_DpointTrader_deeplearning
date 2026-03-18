@@ -119,6 +119,15 @@ The backtester in `backtester_engine.py` faithfully models A-share market constr
 - **Take-profit / Stop-loss** — optional, threshold-based
 - **Buy & Hold benchmark** — computed alongside the strategy for alpha estimation
 
+### Execution Layer (P0 Features)
+- **Slippage model**: Fixed 20 bps (0.2%) slippage on execution price
+- **Limit-up/down handling**: Cannot buy on limit-up, cannot sell on limit-down
+- **Suspension handling**: Orders rejected when stock is suspended
+- **ST stock filtering**: Optional filtering of ST stocks
+- **Listing days filter**: Minimum 60 trading days listing requirement
+- **Volume filter**: Minimum daily turnover requirement (default 1M CNY)
+- **Execution statistics**: Tracks order submission, fill, rejection reasons, and slippage costs
+
 ---
 
 ## Project Structure
@@ -135,12 +144,33 @@ The backtester in `backtester_engine.py` faithfully models A-share market constr
 │
 ├── search_engine.py        Random search: explore / exploit / pool-exploit rounds
 ├── trainer_optimizer.py    Public training API; full-sample final fit
-├── splitter.py             Walk-forward splits + adaptive fold count
-├── metrics.py              Geometric mean ratio; trade-count penalty
-├── backtester_engine.py    A-share event-driven backtest engine
+├── splitter.py             Walk-forward splits + adaptive fold count + final holdout
+├── metrics.py              Geometric mean ratio; trade-count penalty + full risk metrics
+├── backtester_engine.py    A-share event-driven backtest engine + execution layer
+├── calibration.py          Probability calibration (Platt, Isotonic, Brier score, ECE/MCE)
+├── explainer.py            Feature importance (tree, permutation, SHAP) & usage tracking
+├── regime.py               Market regime detection & stratified analysis
+├── rolling_trainer.py     Rolling retrain scheduler (expanding/rolling window)
 ├── persistence.py          best_so_far.json / best_pool.json I/O
-├── reporter.py             Excel workbook + run config JSON writer
-└── constants.py            Global constants (penalty weights, filenames)
+├── reporter.py             Excel workbook + JSON + HTML report
+├── html_reporter.py       HTML dashboard with equity curves, calibration plots
+├── run_manifest.py        Experiment manifest management & replay
+├── repro.py               Reproducibility tools (seed, environment lock)
+├── compare_runs.py        Compare results between runs
+│
+├── constants.py           Global constants (penalty weights, filenames)
+│
+├── tests/                 Automated test suite
+│   ├── test_no_leakage.py    Temporal leakage tests
+│   ├── test_splitter.py      Walk-forward splitter tests
+│   ├── test_execution.py     Execution layer tests
+│   ├── test_fee_lot.py       Fee and lot size tests
+│   ├── test_metrics.py       Risk metrics tests
+│   ├── test_smoke.py        Smoke tests
+│   ├── test_cli.py          CLI argument tests
+│   ├── test_reproducibility.py  Reproducibility tests
+│   ├── test_rejection.py    Order rejection logic tests
+│   └── conftest.py          Test fixtures
 ```
 
 ---
@@ -266,6 +296,18 @@ The tool will interactively ask which run to use, then open a file picker for th
 | `--n_jobs` | `1` | Parallel jobs (auto-limited when CUDA is active) |
 | `--seed` | `42` | Random seed |
 | `--eval_tickers` | `` | Comma-separated paths for cross-ticker evaluation |
+| `--use_holdout` | `1` | Enable final holdout test (1=yes, 0=no) |
+| `--holdout_ratio` | `0.15` | Holdout ratio (15% default) |
+| `--use_embargo` | `0` | Enable embargo gap to prevent temporal leakage |
+| `--embargo_days` | `5` | Embargo days between train/val |
+| `--use_sensitivity_analysis` | `1` | Enable parameter sensitivity analysis |
+| `--use_regime_analysis` | `0` | Enable market regime stratified analysis |
+| `--experiment_dir` | `auto` | Experiment-specific output directory |
+| `--replay` | `` | Replay from historical experiment |
+| `--rolling_mode` | `` | Rolling retrain mode: expanding, rolling |
+| `--rolling_window_length` | `None` | Rolling window length (days) |
+| `--retrain_frequency` | `monthly` | Retrain frequency: daily, weekly, monthly, quarterly |
+| `--export_lock` | `` | Export environment lock file |
 
 ---
 
@@ -285,17 +327,37 @@ Each run produces three files in `--output_dir`:
 | Sheet | Contents |
 |---|---|
 | **Trades** | Every trade: entry/exit date, price, PnL, return, status |
-| **EquityCurve** | Daily equity, cash, market value, drawdown, Buy & Hold benchmark |
+| **EquityCurve** | Daily equity, cash, market value, drawdown, daily returns, Buy & Hold benchmark |
 | **Config** | All feature / model / trade parameters for this run |
 | **Log** | Data loader report, training summary, search log per iteration |
 | **ModelParams** | Feature coefficients and scaler parameters (LogReg/SGD only) |
+| **RiskMetrics** | Complete risk metrics: Sharpe, Sortino, Calmar, Max Drawdown, etc. |
+| **RegimeAnalysis** | Regime-based performance breakdown (high/low volatility, trend/non-trend) |
+| **RegimeStratified** | Detailed metrics by market regime |
+| **TradeDistribution** | Trade distribution statistics (PnL, holding days) |
+| **CalibrationMetrics** | Probability calibration results (Brier score, ECE, MCE) |
+| **FeatureUsage** | Feature group usage frequency during search |
+| **FeatureImportance** | Best model feature importance (tree, permutation, SHAP) |
 
 ---
 
 ## Key Design Decisions
 
-### Walk-forward validation
+### Walk-forward validation with Final Holdout
 The optimizer evaluates each candidate using non-overlapping out-of-sample validation windows. The training set expands (expanding window), while each validation fold is strictly after the training data. The objective metric is the **geometric mean of per-fold equity ratios**, which naturally penalizes inconsistent or high-variance strategies.
+
+**Multi-stage validation:**
+1. **Search OOS**: Walk-forward cross-validation on search data
+2. **Selection OOS**: Top-K candidates re-validated on search data
+3. **Final Holdout OOS**: Best configuration evaluated on completely held-out data (15% by default)
+
+### Anti-overfitting Mechanisms
+- **Final Holdout Split**: 15% of data held out from search, never touched until final evaluation
+- **Nested Walk-Forward**: Inner CV for model selection within each outer fold
+- **Embargo Gap**: 5-day gap between training and validation to prevent look-ahead bias
+- **Parameter Sensitivity Analysis**: Checks if optimal solution is "too sharp"
+- **Multi-seed Stability**: Top-N candidates re-evaluated with multiple seeds
+- **Penalty Terms**: Worst-fold penalty, fold-variance penalty, too-few-trades penalty
 
 ### Trade-count penalty
 A soft penalty discourages configurations that generate too few or too many trades per fold. This prevents the optimizer from converging on degenerate solutions (e.g., never trading or trading every day).
@@ -319,3 +381,36 @@ The incumbent is updated after every round, so each subsequent round's exploit c
 - **No live trading integration** — This is a research tool. There is no order management, broker connectivity, or real-time data feed.
 - **Stamp duty rate** — The default sell-side cost uses 0.10% stamp duty (pre-2023 rate). Pass `commission_rate_sell=0.0008` to use the post-August-2023 rate of 0.05%.
 - **Cross-ticker generalization** — The `--eval_tickers` flag uses hyperparameter transfer (same config, retrain from scratch on new ticker). It does **not** transfer model weights.
+
+---
+
+## Advanced Features
+
+### Probability Calibration
+The system supports probability calibration to improve prediction reliability:
+- **Methods**: None, Platt Scaling, Isotonic Regression
+- **Metrics**: Brier Score, Expected Calibration Error (ECE), Maximum Calibration Error (MCE)
+- **Validation**: Calibration fitted only on validation set, not on test data
+
+### Feature Importance & Explainability
+- **Feature Usage Tracking**: Records which feature groups are used during search
+- **Tree Model Importance**: Native feature importance for XGBoost
+- **Permutation Importance**: Model-agnostic importance estimation
+- **SHAP Values**: For tree models and linear models (if SHAP is installed)
+
+### Market Regime Analysis
+- **Trend Detection**: Based on MA crossover (short vs long MA)
+- **Volatility Regime**: High/Low/Medium volatility based on rolling volatility
+- **Combined Regime**: Trend × Volatility matrix
+- **Stratified Metrics**: Performance metrics broken down by regime
+
+### Rolling Retrain
+- **Window Types**: Expanding window (grows over time) or Rolling window (fixed length)
+- **Retrain Frequencies**: Daily, Weekly, Monthly, Quarterly
+- **Snapshot Management**: Keeps track of model snapshots for rollback
+
+### Reproducibility
+- **Global Seed**: Sets seeds for Python, NumPy, PyTorch, TensorFlow
+- **Environment Lock**: Exports `requirements-lock.txt` for environment reproducibility
+- **Experiment Manifest**: Each run generates `manifest.json` with full metadata
+- **CLI Replay**: Re-run experiments from historical manifest

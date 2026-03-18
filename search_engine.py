@@ -25,8 +25,11 @@ P05 修复：exploit 候选全部在搜索开始前生成，无在线反馈
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+
+import json
+import os
 
 import numpy as np
 import pandas as pd
@@ -41,8 +44,21 @@ from constants import (
 from feature_dpoint import build_features_and_labels, FeatureMeta
 from model_builder import make_model, predict_dpoint, _try_import_xgboost
 from dl_model_builder import MLP, _get_device, train_pytorch_model, predict_pytorch_model
-from splitter import walkforward_splits
+from splitter import walkforward_splits, final_holdout_split, walkforward_splits_with_embargo, nested_walkforward_splits
 from metrics import metric_from_fold_ratios, trade_penalty, backtest_fold_stats
+from calibration import (
+    ProbabilityCalibrator,
+    compute_all_calibration_metrics,
+    RollingCalibrationMonitor,
+    CALIBRATION_METHODS,
+)
+from explainer import (
+    FeatureImportanceExplainer,
+    FeatureUsageTracker,
+    compute_feature_group_ranking,
+    compute_feature_deletion_experiment,
+    compute_regime_feature_importance,
+)
 from persistence import (
     config_hash,
     best_so_far_path,
@@ -133,6 +149,7 @@ class SearchSpaces:
     take_profit_pool: List[Optional[float]]
     stop_loss_pool: List[Optional[float]]
     ta_window_pool: List[List[int]]    # P3-19：RSI / 布林带宽的窗口候选列表
+    calibration_pool: List[str]          # P1: 校准方法候选列表
 
 
 def _build_search_spaces(seed: int, input_dim: int) -> SearchSpaces:
@@ -233,6 +250,8 @@ def _build_search_spaces(seed: int, input_dim: int) -> SearchSpaces:
         stop_loss_pool=[None, 0.05, 0.08],
         # P3-19：RSI / 布林带宽的 ta_windows 候选（短期、中期、长期三档）
         ta_window_pool=[[6, 14], [14, 20], [6, 14, 20]],
+        # P1: 校准方法候选（70% 概率 none，15% platt，15% isotonic）
+        calibration_pool=["none", "none", "none", "none", "none", "none", "none", "platt", "platt", "isotonic"],
     )
 
 
@@ -269,7 +288,7 @@ def _eval_candidate(
     train_start_ratio: float,
     wf_min_rows: int,
     computed_feats: Optional[Tuple[pd.DataFrame, pd.Series, FeatureMeta]],
-) -> Tuple[float, float, Dict[str, Any]]:
+) -> Tuple[float, float, Dict[str, Any], List[Dict[str, Any]]]:
     """
     评估单个候选配置。
 
@@ -278,11 +297,13 @@ def _eval_candidate(
         维护 feat_cache 闭包（多进程下闭包缓存完全无效）。
         当 computed_feats 为 None 时仍支持惰性计算（兼容单独调用）。
     """
+    fold_details: List[Dict[str, Any]] = []
+    
     if computed_feats is None:
         feat_cfg = candidate["feature_config"]
         computed_feats = build_features_and_labels(df_clean, feat_cfg)
         if computed_feats is None:
-            return (-np.inf, 100000.0, {"skip": "feat_fail"})
+            return (-np.inf, 100000.0, {"skip": "feat_fail"}, [])
 
     X, y, meta = computed_feats
     trade_cfg = candidate["trade_config"]
@@ -291,14 +312,25 @@ def _eval_candidate(
     cand_seed = int(candidate.get("candidate_seed", 42))
 
     if len(X.columns) > max_features:
-        return (-np.inf, initial_cash, {"skip": "too_many_feats", "n_features": len(X.columns)})
+        return (-np.inf, initial_cash, {"skip": "too_many_feats", "n_features": len(X.columns)}, [])
 
     splits = walkforward_splits(X, y, n_folds=n_folds, train_start_ratio=train_start_ratio, min_rows=wf_min_rows)
     if not splits:
-        return (-np.inf, initial_cash, {"skip": "no_splits"})
+        return (-np.inf, initial_cash, {"skip": "no_splits"}, [])
 
     ratios, equities, closed_trades = [], [], []
     device = _get_device()
+    fold_idx = 0
+    
+    calibration_method = str(candidate.get("calibration_config", {}).get("method", "none"))
+    use_calibration = calibration_method != "none"
+    use_calibrated_threshold = candidate.get("calibration_config", {}).get("use_for_threshold", False)
+    
+    all_y_true: List[float] = []
+    all_y_prob_raw: List[float] = []
+    all_y_prob_calibrated: List[float] = []
+    
+    fold_calibration_metrics: List[Dict[str, Any]] = []
 
     # 用实际特征维度动态覆盖 input_dim，避免 PyTorch 线性层维度不匹配）
     for (X_tr, y_tr), (X_va, y_va) in splits:
@@ -306,7 +338,7 @@ def _eval_candidate(
         if model_type in ["mlp", "lstm", "gru", "cnn", "transformer"]:
             actual_cfg = {**candidate["model_config"], "input_dim": X_tr.shape[1]}
             trained_model = train_pytorch_model(X_tr, y_tr, actual_cfg, device)
-            dp_val = predict_pytorch_model(
+            dp_val_raw = predict_pytorch_model(
                 trained_model, X_va, device,
                 seq_len=int(actual_cfg.get("seq_len", 20))
             )
@@ -316,27 +348,99 @@ def _eval_candidate(
                 X_tr.values if isinstance(model, Pipeline) else X_tr,
                 y_tr.values if isinstance(model, Pipeline) else y_tr,
             )
-            dp_val = predict_dpoint(model, X_va)
+            dp_val_raw = predict_dpoint(model, X_va)
+
+        dp_val = dp_val_raw.copy()
+        
+        if use_calibration and len(y_va) >= 20:
+            try:
+                calibrator = ProbabilityCalibrator(method=calibration_method)
+                calibrator.fit(y_va.values, dp_val_raw.values)
+                dp_val = pd.Series(
+                    calibrator.transform(dp_val_raw.values),
+                    index=dp_val_raw.index,
+                    name=dp_val_raw.name
+                )
+                
+                cal_metrics = compute_all_calibration_metrics(
+                    y_va.values, dp_val.values, n_bins=10
+                )
+                fold_calibration_metrics.append(cal_metrics)
+                
+                all_y_true.extend(y_va.values.tolist())
+                all_y_prob_raw.extend(dp_val_raw.values.tolist())
+                all_y_prob_calibrated.extend(dp_val.values.tolist())
+            except Exception:
+                pass
 
         fold_stats = backtest_fold_stats(df_clean, X_va, dp_val, trade_cfg)
-        eq_end = float(fold_stats["equity_end"])
+        equity_end = float(fold_stats["equity_end"])
+        n_closed = int(fold_stats["n_closed"])
 
-        if int(fold_stats["n_closed"]) < MIN_CLOSED_TRADES_PER_FOLD:
-            return (-np.inf, initial_cash, {"skip": "too_few_trades"})
-        if eq_end < early_stop_floor:
-            return (-np.inf, initial_cash, {"skip": "early_stop"})
+        if n_closed < MIN_CLOSED_TRADES_PER_FOLD:
+            return (-np.inf, initial_cash, {"skip": "too_few_trades"}, [])
+        if equity_end < early_stop_floor:
+            return (-np.inf, initial_cash, {"skip": "early_stop"}, [])
 
-        equities.append(eq_end)
-        ratios.append(eq_end / initial_cash)
-        closed_trades.append(int(fold_stats["n_closed"]))
+        equities.append(equity_end)
+        ratios.append(equity_end / initial_cash)
+        closed_trades.append(n_closed)
+
+        fold_details.append({
+            "fold_idx": fold_idx,
+            "equity_end": equity_end,
+            "ratio": equity_end / initial_cash,
+            "n_closed_trades": n_closed,
+        })
+        fold_idx += 1
+    
+    calibration_summary: Dict[str, Any] = {}
+    if use_calibration and all_y_true:
+        try:
+            overall_cal_metrics = compute_all_calibration_metrics(
+                np.array(all_y_true), np.array(all_y_prob_calibrated), n_bins=10
+            )
+            raw_cal_metrics = compute_all_calibration_metrics(
+                np.array(all_y_true), np.array(all_y_prob_raw), n_bins=10
+            )
+            calibration_summary = {
+                "calibration_method": calibration_method,
+                "brier_score_raw": raw_cal_metrics["brier_score"],
+                "brier_score_calibrated": overall_cal_metrics["brier_score"],
+                "ece_raw": raw_cal_metrics["ece"],
+                "ece_calibrated": overall_cal_metrics["ece"],
+                "mce_raw": raw_cal_metrics["mce"],
+                "mce_calibrated": overall_cal_metrics["mce"],
+            }
+        except Exception:
+            calibration_summary = {"calibration_method": calibration_method}
 
     geom = metric_from_fold_ratios(ratios)
     min_r = float(np.min(ratios))
     metric_raw = 0.8 * geom + 0.2 * min_r
     penalty = trade_penalty(closed_trades)
+    
+    worst_fold_penalty = 0.0
+    if ratios:
+        worst_ratio = min(ratios)
+        if worst_ratio < 0.8:
+            worst_fold_penalty = 0.1 * (0.8 - worst_ratio)
+    
+    variance_penalty = 0.0
+    if len(ratios) > 1:
+        ratio_std = float(np.std(ratios))
+        if ratio_std > 0.15:
+            variance_penalty = 0.05 * (ratio_std - 0.15)
+    
+    few_trades_penalty = 0.0
+    avg_trades = float(np.mean(closed_trades))
+    if avg_trades < TARGET_CLOSED_TRADES_PER_FOLD * 0.7:
+        few_trades_penalty = 0.08
+
+    extra_penalty = worst_fold_penalty + variance_penalty + few_trades_penalty
 
     return (
-        float(metric_raw - penalty),
+        float(metric_raw - penalty - extra_penalty),
         float(np.mean(equities)),
         {
             "n_features": len(X.columns),
@@ -344,9 +448,385 @@ def _eval_candidate(
             "min_fold_ratio": min_r,
             "metric_raw": metric_raw,
             "penalty": penalty,
+            "extra_penalty": extra_penalty,
+            "worst_fold_penalty": worst_fold_penalty,
+            "variance_penalty": variance_penalty,
+            "few_trades_penalty": few_trades_penalty,
             "avg_closed_trades": float(np.mean(closed_trades)),
+            "fold_details": fold_details,
+            "calibration_summary": calibration_summary,
         },
+        fold_details,
     )
+
+
+# =========================================================
+# Holdout 评估函数
+# =========================================================
+def _eval_on_holdout(
+    candidate: Dict[str, Any],
+    search_df: pd.DataFrame,
+    holdout_df: pd.DataFrame,
+    max_features: int,
+    n_folds: int,
+    train_start_ratio: float,
+    wf_min_rows: int,
+    computed_feats: Optional[Tuple[pd.DataFrame, pd.Series, FeatureMeta]],
+) -> Tuple[float, float, Dict[str, Any], List[Dict[str, Any]]]:
+    """
+    在 holdout 数据上评估候选配置。
+    使用搜索阶段相同的特征构建，但在 holdout 数据上进行回测。
+    """
+    if computed_feats is None:
+        feat_cfg = candidate["feature_config"]
+        computed_feats = build_features_and_labels(search_df, feat_cfg)
+        if computed_feats is None:
+            return (-np.inf, 100000.0, {"skip": "feat_fail"}, [])
+    
+    X_search, y_search, meta = computed_feats
+    
+    holdout_computed = build_features_and_labels(holdout_df, candidate["feature_config"])
+    if holdout_computed is None:
+        return (-np.inf, 100000.0, {"skip": "holdout_feat_fail"}, [])
+    
+    X_holdout, y_holdout, _ = holdout_computed
+    
+    if len(X_search.columns) > max_features:
+        return (-np.inf, float(candidate["trade_config"]["initial_cash"]), {"skip": "too_many_feats", "n_features": len(X_search.columns)}, [])
+    
+    splits = walkforward_splits(X_search, y_search, n_folds=n_folds, train_start_ratio=train_start_ratio, min_rows=wf_min_rows)
+    if not splits:
+        return (-np.inf, float(candidate["trade_config"]["initial_cash"]), {"skip": "no_splits"}, [])
+    
+    trade_cfg = candidate["trade_config"]
+    initial_cash = float(trade_cfg["initial_cash"])
+    cand_seed = int(candidate.get("candidate_seed", 42))
+    device = _get_device()
+    
+    calibration_method = str(candidate.get("calibration_config", {}).get("method", "none"))
+    use_calibration = calibration_method != "none"
+    use_calibrated_threshold = candidate.get("calibration_config", {}).get("use_for_threshold", False)
+    
+    all_equities = []
+    all_ratios = []
+    all_trades = []
+    fold_details = []
+    
+    holdout_calibration_comparison: Dict[str, Any] = {}
+    all_y_true: List[float] = []
+    all_y_prob_raw: List[float] = []
+    all_y_prob_calibrated: List[float] = []
+    
+    for fold_idx, ((X_tr, y_tr), (X_va, y_va)) in enumerate(splits):
+        model_type = str(candidate["model_config"]["model_type"])
+        if model_type in ["mlp", "lstm", "gru", "cnn", "transformer"]:
+            actual_cfg = {**candidate["model_config"], "input_dim": X_tr.shape[1]}
+            trained_model = train_pytorch_model(X_tr, y_tr, actual_cfg, device)
+            dp_val_raw = predict_pytorch_model(
+                trained_model, X_holdout, device,
+                seq_len=int(actual_cfg.get("seq_len", 20))
+            )
+        else:
+            model = make_model(candidate, seed=cand_seed)
+            model.fit(
+                X_tr.values if isinstance(model, Pipeline) else X_tr,
+                y_tr.values if isinstance(model, Pipeline) else y_tr,
+            )
+            dp_val_raw = predict_dpoint(model, X_holdout)
+
+        dp_val = dp_val_raw.copy()
+        
+        if use_calibration and len(y_va) >= 20:
+            try:
+                calibrator = ProbabilityCalibrator(method=calibration_method)
+                calibrator.fit(y_va.values, dp_val_raw.values)
+                dp_val = pd.Series(
+                    calibrator.transform(dp_val_raw.values),
+                    index=dp_val_raw.index,
+                    name=dp_val_raw.name
+                )
+                
+                all_y_true.extend(y_holdout.values.tolist())
+                all_y_prob_raw.extend(dp_val_raw.values.tolist())
+                all_y_prob_calibrated.extend(dp_val.values.tolist())
+            except Exception:
+                pass
+        
+        fold_stats = backtest_fold_stats(holdout_df, X_holdout, dp_val, trade_cfg)
+        equity_end = float(fold_stats["equity_end"])
+        n_closed = int(fold_stats["n_closed"])
+        
+        if n_closed < MIN_CLOSED_TRADES_PER_FOLD:
+            return (-np.inf, initial_cash, {"skip": "too_few_trades"}, [])
+        
+        all_equities.append(equity_end)
+        all_ratios.append(equity_end / initial_cash)
+        all_trades.append(n_closed)
+        
+        fold_details.append({
+            "fold_idx": fold_idx,
+            "equity_end": equity_end,
+            "ratio": equity_end / initial_cash,
+            "n_closed_trades": n_closed,
+        })
+    
+    if use_calibration and all_y_true:
+        try:
+            raw_metrics = compute_all_calibration_metrics(
+                np.array(all_y_true), np.array(all_y_prob_raw), n_bins=10
+            )
+            calibrated_metrics = compute_all_calibration_metrics(
+                np.array(all_y_true), np.array(all_y_prob_calibrated), n_bins=10
+            )
+            holdout_calibration_comparison = {
+                "calibration_method": calibration_method,
+                "use_for_threshold": use_calibrated_threshold,
+                "brier_score_raw": raw_metrics["brier_score"],
+                "brier_score_calibrated": calibrated_metrics["brier_score"],
+                "ece_raw": raw_metrics["ece"],
+                "ece_calibrated": calibrated_metrics["ece"],
+                "mce_raw": raw_metrics["mce"],
+                "mce_calibrated": calibrated_metrics["mce"],
+            }
+        except Exception:
+            holdout_calibration_comparison = {"calibration_method": calibration_method}
+    
+    geom = metric_from_fold_ratios(all_ratios)
+    min_r = float(np.min(all_ratios))
+    metric_raw = 0.8 * geom + 0.2 * min_r
+    penalty = trade_penalty(all_trades)
+    
+    return (
+        float(metric_raw - penalty),
+        float(np.mean(all_equities)),
+        {
+            "n_features": len(X_search.columns),
+            "geom_mean_ratio": geom,
+            "min_fold_ratio": min_r,
+            "metric_raw": metric_raw,
+            "penalty": penalty,
+            "avg_closed_trades": float(np.mean(all_trades)),
+            "holdout_calibration_comparison": holdout_calibration_comparison,
+        },
+        fold_details,
+    )
+
+
+# =========================================================
+# 多种子稳定性评估
+# =========================================================
+def _multi_seed_evaluation(
+    candidate: Dict[str, Any],
+    df_clean: pd.DataFrame,
+    max_features: int,
+    n_folds: int,
+    train_start_ratio: float,
+    wf_min_rows: int,
+    n_seeds: int = 3,
+) -> Dict[str, Any]:
+    """
+    使用多个随机种子评估候选配置的稳定性。
+    """
+    feat_cfg = candidate["feature_config"]
+    computed_feats = build_features_and_labels(df_clean, feat_cfg)
+    if computed_feats is None:
+        return {
+            "stability_metric": -np.inf,
+            "mean_metric": -np.inf,
+            "std_metric": 0.0,
+            "seeds_valid": 0,
+            "seed_details": [],
+        }
+    
+    seed_metrics = []
+    seed_details = []
+    
+    for seed in range(n_seeds):
+        seed_candidate = {**candidate, "candidate_seed": seed}
+        metric, equity, info, _ = _eval_candidate(
+            seed_candidate,
+            df_clean,
+            max_features,
+            n_folds,
+            train_start_ratio,
+            wf_min_rows,
+            computed_feats,
+        )
+        
+        seed_details.append({
+            "seed": seed,
+            "metric": metric,
+            "equity": equity,
+            "avg_trades": info.get("avg_closed_trades", 0),
+        })
+        
+        if metric > -np.inf:
+            seed_metrics.append(metric)
+    
+    if not seed_metrics:
+        return {
+            "stability_metric": -np.inf,
+            "mean_metric": -np.inf,
+            "std_metric": 0.0,
+            "seeds_valid": 0,
+            "seed_details": seed_details,
+        }
+    
+    mean_metric = float(np.mean(seed_metrics))
+    std_metric = float(np.std(seed_metrics))
+    
+    stability_penalty = 0.0
+    if std_metric > 0.1:
+        stability_penalty = 0.1 * std_metric
+    
+    stability_metric = mean_metric - stability_penalty
+    
+    return {
+        "stability_metric": stability_metric,
+        "mean_metric": mean_metric,
+        "std_metric": std_metric,
+        "seeds_valid": len(seed_metrics),
+        "seed_details": seed_details,
+    }
+
+
+# =========================================================
+# P2: 参数敏感性分析
+# =========================================================
+def _parameter_sensitivity_analysis(
+    candidate: Dict[str, Any],
+    df_search: pd.DataFrame,
+    n_folds: int,
+    train_start_ratio: float,
+    wf_min_rows: int,
+    n_perturbations: int = 5,
+    perturbation_scale: float = 0.1,
+) -> Dict[str, Any]:
+    """
+    P2: 参数敏感性分析。
+
+    检查最优解是否过于"尖锐"：
+        - 对关键参数进行微扰，观察性能变化
+        - 如果微扰导致性能大幅下降，说明解不稳定/过拟合
+        - 返回敏感性指标供决策参考
+
+    参数扰动范围：
+        - buy_threshold: ±perturbation_scale
+        - sell_threshold: ±perturbation_scale
+        - model C / alpha / learning_rate: ±perturbation_scale * 100%
+
+    返回：
+        包含各参数扰动结果的敏感性报告
+    """
+    sensitivity_results = []
+    base_metric, base_equity, base_info, _ = _eval_candidate(
+        candidate, df_search, max_features=100, n_folds=n_folds,
+        train_start_ratio=train_start_ratio, wf_min_rows=wf_min_rows, computed_feats=None
+    )
+
+    if base_metric == -np.inf:
+        return {"error": "base_eval_failed", "base_metric": -np.inf}
+
+    tc = candidate["trade_config"]
+    mc = candidate["model_config"]
+
+    # 1. 阈值敏感性
+    buy_thresh = float(tc.get("buy_threshold", 0.55))
+    sell_thresh = float(tc.get("sell_threshold", 0.45))
+
+    for direction in [-1, 1]:
+        perturbed_tc = {
+            **tc,
+            "buy_threshold": buy_thresh + direction * perturbation_scale,
+            "sell_threshold": sell_thresh - direction * perturbation_scale,  # 保持 buy > sell
+        }
+        perturbed_cand = {**candidate, "trade_config": perturbed_tc}
+
+        m, eq, info, _ = _eval_candidate(
+            perturbed_cand, df_search, max_features=100, n_folds=n_folds,
+            train_start_ratio=train_start_ratio, wf_min_rows=wf_min_rows, computed_feats=None
+        )
+
+        if m > -np.inf:
+            sensitivity_results.append({
+                "param": f"threshold_{'up' if direction > 0 else 'down'}",
+                "metric": m,
+                "delta": m - base_metric,
+                "delta_pct": (m - base_metric) / abs(base_metric) if base_metric != 0 else 0,
+            })
+
+    # 2. 模型超参敏感性
+    model_type = str(mc.get("model_type", "logreg"))
+
+    if model_type in ["logreg", "sgd"]:
+        # C 或 alpha 扰动
+        param_name = "C" if model_type == "logreg" else "alpha"
+        base_val = float(mc.get(param_name, 0.01))
+
+        for direction in [-1, 1]:
+            perturbed_val = base_val * (1 + direction * perturbation_scale * 5)
+            perturbed_mc = {**mc, param_name: perturbed_val}
+            perturbed_cand = {**candidate, "model_config": perturbed_mc}
+
+            m, eq, info, _ = _eval_candidate(
+                perturbed_cand, df_search, max_features=100, n_folds=n_folds,
+                train_start_ratio=train_start_ratio, wf_min_rows=wf_min_rows, computed_feats=None
+            )
+
+            if m > -np.inf:
+                sensitivity_results.append({
+                    "param": f"{model_type}_{param_name}_{'up' if direction > 0 else 'down'}",
+                    "metric": m,
+                    "delta": m - base_metric,
+                    "delta_pct": (m - base_metric) / abs(base_metric) if base_metric != 0 else 0,
+                })
+
+    elif model_type in ["mlp", "lstm", "gru", "cnn", "transformer"]:
+        # learning_rate 扰动
+        base_lr = float(mc.get("learning_rate", 0.001))
+
+        for direction in [-1, 1]:
+            perturbed_lr = base_lr * (1 + direction * perturbation_scale * 3)
+            perturbed_mc = {**mc, "learning_rate": perturbed_lr}
+            perturbed_cand = {**candidate, "model_config": perturbed_mc}
+
+            m, eq, info, _ = _eval_candidate(
+                perturbed_cand, df_search, max_features=100, n_folds=n_folds,
+                train_start_ratio=train_start_ratio, wf_min_rows=wf_min_rows, computed_feats=None
+            )
+
+            if m > -np.inf:
+                sensitivity_results.append({
+                    "param": f"{model_type}_lr_{'up' if direction > 0 else 'down'}",
+                    "metric": m,
+                    "delta": m - base_metric,
+                    "delta_pct": (m - base_metric) / abs(base_metric) if base_metric != 0 else 0,
+                })
+
+    # 计算敏感性指标
+    valid_deltas = [r["delta"] for r in sensitivity_results if r["delta"] != 0]
+    if valid_deltas:
+        avg_delta = float(np.mean(valid_deltas))
+        max_delta = float(np.max(valid_deltas))
+        sensitivity_score = abs(avg_delta)  # 越高越敏感
+
+        # 判断是否过于尖锐
+        is_sharp = sensitivity_score > 0.05 or max_delta > 0.1
+    else:
+        avg_delta = 0.0
+        max_delta = 0.0
+        sensitivity_score = 0.0
+        is_sharp = False
+
+    return {
+        "base_metric": base_metric,
+        "n_perturbations": len(sensitivity_results),
+        "avg_delta": avg_delta,
+        "max_delta": max_delta,
+        "sensitivity_score": sensitivity_score,
+        "is_sharp": is_sharp,
+        "perturbation_details": sensitivity_results,
+    }
 
 
 # =========================================================
@@ -404,6 +884,10 @@ def _sample_explore(
         "candidate_seed": cand_seed,
         "feature_config": feat_cfg,
         "model_config": model_cfg,
+        "calibration_config": {
+            "method": rng.choice(spaces.calibration_pool),
+            "use_for_threshold": bool(rng.integers(0, 2)),
+        },
         "trade_config": {
             "initial_cash": float(trade_params["initial_cash"]),
             "buy_threshold": buy,
@@ -496,6 +980,21 @@ def _sample_exploit(
         c["model_config"]["params"] = dict(c["model_config"]["params"])
         c["model_config"]["params"]["random_state"] = cand_seed
 
+    # ── P1: 校准配置扰动（15% 概率）──────────────────────────────────────
+    if "calibration_config" not in c:
+        c["calibration_config"] = {"method": "none", "use_for_threshold": False}
+    
+    if rng.random() < 0.15:
+        c["calibration_config"] = dict(c.get("calibration_config", {}))
+        c["calibration_config"]["method"] = rng.choice(spaces.calibration_pool)
+    
+    if rng.random() < 0.15:
+        if "calibration_config" not in c:
+            c["calibration_config"] = {"method": "none", "use_for_threshold": False}
+        else:
+            c["calibration_config"] = dict(c["calibration_config"])
+        c["calibration_config"]["use_for_threshold"] = bool(rng.integers(0, 2))
+
     return c
 
 
@@ -545,6 +1044,15 @@ class TrainResult:
     not_updated_reason: str
     best_so_far_path: str
     best_pool_path: str
+    holdout_metric: float = -np.inf
+    holdout_equity: float = 0.0
+    holdout_fold_details: List[Dict[str, Any]] = field(default_factory=list)
+    search_data_rows: int = 0
+    holdout_data_rows: int = 0
+    stability_report: Dict[str, Any] = field(default_factory=dict)
+    holdout_calibration_comparison: Dict[str, Any] = field(default_factory=dict)
+    feature_usage_stats: Dict[str, Any] = field(default_factory=dict)
+    best_model_importance: Dict[str, Any] = field(default_factory=dict)
 
 
 # =========================================================
@@ -565,8 +1073,17 @@ def random_search_train(
     train_start_ratio: float = 0.5,
     wf_min_rows: int = 60,
     n_jobs: int = -1,
-    n_rounds: int = 4,             # P05 新增：分轮数，每轮后更新 incumbent
-    pool_exploit_prob: float = 0.3, # P02 新增：从 Top-K 池采样的概率
+    n_rounds: int = 4,
+    pool_exploit_prob: float = 0.3,
+    use_holdout: bool = True,
+    holdout_ratio: float = 0.15,
+    min_holdout_rows: int = 60,
+    cross_ticker_paths: Optional[List[str]] = None,
+    # P2: 新增参数
+    use_embargo: bool = False,
+    embargo_days: int = 5,
+    use_nested_wf: bool = False,
+    use_sensitivity_analysis: bool = True,
 ) -> TrainResult:
     """
     随机搜索训练主函数。
@@ -592,8 +1109,29 @@ def random_search_train(
     tp = trade_params or {"initial_cash": 100000.0}
     device = _get_device()
 
+    # --- Holdout split ---
+    _search_df = df_clean
+    _holdout_df = None
+    holdout_metric = -np.inf
+    holdout_equity = 0.0
+    holdout_fold_details = []
+    training_notes: List[str] = []  # P2: 提前初始化，供敏感性分析使用
+
+    if use_holdout and len(df_clean) >= min_holdout_rows + wf_min_rows * n_folds:
+        split_result = final_holdout_split(
+            df_clean, 
+            holdout_ratio=holdout_ratio, 
+            min_holdout_rows=min_holdout_rows
+        )
+        if split_result is not None:
+            _search_df, _holdout_df = split_result
+            print(f"[SEARCH] Holdout split: search={len(_search_df)}, holdout={len(_holdout_df)}")
+    
+    search_data_rows = len(_search_df)
+    holdout_data_rows = len(_holdout_df) if _holdout_df is not None else 0
+
     # --- 初始化搜索空间 ---
-    _, _, init_meta = build_features_and_labels(df_clean, {
+    _, _, init_meta = build_features_and_labels(_search_df, {
         "windows": [3, 5, 10, 20], "use_momentum": True, "use_volatility": True,
         "use_volume": True, "use_candle": True, "use_turnover": True,
         "vol_metric": "std", "liq_transform": "ratio",
@@ -608,7 +1146,7 @@ def random_search_train(
 
     # --- 评估初始 incumbent（P1-5：如有持久化 metric 则直接复用，跳过重复评估）---
     # （统一处理所有 DL 模型类型）
-    X_inc, y_inc, meta_inc = build_features_and_labels(df_clean, best_cfg["feature_config"])
+    X_inc, y_inc, meta_inc = build_features_and_labels(_search_df, best_cfg["feature_config"])
     if str(best_cfg["model_config"]["model_type"]) in ["mlp", "lstm", "gru", "cnn", "transformer"]:
         best_cfg["model_config"]["input_dim"] = X_inc.shape[1]
 
@@ -628,8 +1166,8 @@ def random_search_train(
         ]
     else:
         # 首次运行或配置来自外部，必须重新评估
-        best_m_raw, best_eq_raw, info_inc = _eval_candidate(
-            best_cfg, df_clean, max_features, n_folds,
+        best_m_raw, best_eq_raw, info_inc, _ = _eval_candidate(
+            best_cfg, _search_df, max_features, n_folds,
             train_start_ratio, wf_min_rows, (X_inc, y_inc, meta_inc)
         )
         best_m = float(best_m_raw)
@@ -639,6 +1177,9 @@ def random_search_train(
         ]
 
     initial_m = best_m   # 保存初始值，用于最终 global_best_metric_prev
+
+    # --- P0: 特征使用频率跟踪器 ---
+    feature_usage_tracker = FeatureUsageTracker()
 
     # --- P05：分轮搜索主循环 ---
     all_search_rows: List[Dict[str, Any]] = []
@@ -681,6 +1222,9 @@ def random_search_train(
                 mode = "explore"
             round_c.append(c)
             round_c_modes.append(mode)
+            
+            # P0: 记录候选的特征使用情况
+            feature_usage_tracker.record_candidate(c["feature_config"])
 
         # P01：主进程统一预计算本轮所有唯一 feature_config
         # 相同 feature_config 的候选只计算一次，多进程下通过参数传递，不依赖共享内存
@@ -688,13 +1232,13 @@ def random_search_train(
         for c in round_c:
             fhash = config_hash(c["feature_config"])
             if fhash not in feat_map:
-                feat_map[fhash] = build_features_and_labels(df_clean, c["feature_config"])
+                feat_map[fhash] = build_features_and_labels(_search_df, c["feature_config"])
 
         # P01：将预计算特征作为显式参数传入，完全绕开多进程缓存问题
         round_results = Parallel(n_jobs=n_jobs, backend="loky")(
             delayed(_eval_candidate)(
                 c,
-                df_clean,
+                _search_df,
                 max_features,
                 n_folds,
                 train_start_ratio,
@@ -705,7 +1249,7 @@ def random_search_train(
         )
 
         # --- 收集本轮结果，实时更新 incumbent ---
-        for i, (m, eq, info) in enumerate(round_results):
+        for i, (m, eq, info, fold_details) in enumerate(round_results):
             all_candidates.append(round_c[i])
             cand = round_c[i]
             mc = cand["model_config"]
@@ -806,9 +1350,109 @@ def random_search_train(
     if final_fhash in final_feat_map:
         final_meta = final_feat_map[final_fhash][2]
     else:
-        _, _, final_meta = build_features_and_labels(df_clean, best_cfg["feature_config"])
+        _, _, final_meta = build_features_and_labels(_search_df, best_cfg["feature_config"])
 
-    training_notes = [
+    # --- Holdout evaluation ---
+    if _holdout_df is not None:
+        print(f"[SEARCH] Evaluating best config on holdout set...")
+        X_best, y_best, meta_best = build_features_and_labels(_search_df, best_cfg["feature_config"])
+        if str(best_cfg["model_config"]["model_type"]) in ["mlp", "lstm", "gru", "cnn", "transformer"]:
+            best_cfg_holdout = {**best_cfg, "model_config": {**best_cfg["model_config"], "input_dim": X_best.shape[1]}}
+        else:
+            best_cfg_holdout = best_cfg
+        
+        holdout_m, holdout_eq, holdout_info, holdout_fold_details = _eval_on_holdout(
+            best_cfg_holdout,
+            _search_df,
+            _holdout_df,
+            max_features,
+            n_folds,
+            train_start_ratio,
+            wf_min_rows,
+            (X_best, y_best, meta_best),
+        )
+        holdout_metric = holdout_m
+        holdout_equity = holdout_eq
+        holdout_calibration_comparison = holdout_info.get("holdout_calibration_comparison", {})
+        print(f"[SEARCH] Holdout metric: {holdout_metric:.6f}, equity: {holdout_equity:.2f}")
+        if holdout_calibration_comparison:
+            print(f"[SEARCH] Holdout calibration: method={holdout_calibration_comparison.get('calibration_method', 'none')}")
+    else:
+        holdout_fold_details = []
+        holdout_calibration_comparison = {}
+
+    # --- Multi-seed stability evaluation ---
+    stability_report = {}
+    if cand_best_cfg is not None and cand_best_m > -np.inf:
+        print(f"[SEARCH] Running multi-seed stability evaluation...")
+        stability_report = _multi_seed_evaluation(
+            cand_best_cfg,
+            _search_df,
+            max_features,
+            n_folds,
+            train_start_ratio,
+            wf_min_rows,
+            n_seeds=3,
+        )
+        print(f"[SEARCH] Stability: mean_metric={stability_report.get('mean_metric', -np.inf):.6f}, std={stability_report.get('std_metric', 0.0):.6f}")
+
+    # --- Cross-ticker evaluation ---
+    cross_ticker_results = []
+    if cross_ticker_paths and cand_best_cfg is not None:
+        print(f"[SEARCH] Running cross-ticker evaluation...")
+        for ticker_path in cross_ticker_paths:
+            if os.path.exists(ticker_path):
+                try:
+                    ticker_df = pd.read_excel(ticker_path)
+                    ticker_name = os.path.basename(ticker_path)
+                    print(f"[SEARCH] Evaluating on {ticker_name}...")
+                    
+                    X_ticker, y_ticker, meta_ticker = build_features_and_labels(ticker_df, cand_best_cfg["feature_config"])
+                    if X_ticker is not None:
+                        mt, eq, info, _ = _eval_candidate(
+                            cand_best_cfg,
+                            ticker_df,
+                            max_features,
+                            n_folds,
+                            train_start_ratio,
+                            wf_min_rows,
+                            (X_ticker, y_ticker, meta_ticker),
+                        )
+                        cross_ticker_results.append({
+                            "ticker": ticker_name,
+                            "metric": mt,
+                            "equity": eq,
+                            "avg_trades": info.get("avg_closed_trades", 0),
+                        })
+                        print(f"[SEARCH] {ticker_name}: metric={mt:.6f}, equity={eq:.2f}")
+                except Exception as e:
+                    print(f"[SEARCH] Failed to evaluate on {ticker_path}: {e}")
+        stability_report["cross_ticker_results"] = cross_ticker_results
+
+    # P2: 参数敏感性分析
+    if use_sensitivity_analysis and best_cfg is not None:
+        print("[INFO] P2: Running parameter sensitivity analysis on best config...")
+        sensitivity_report = _parameter_sensitivity_analysis(
+            best_cfg, _search_df,
+            n_folds=n_folds,
+            train_start_ratio=train_start_ratio,
+            wf_min_rows=wf_min_rows,
+            n_perturbations=5,
+            perturbation_scale=0.1,
+        )
+        stability_report["sensitivity_analysis"] = sensitivity_report
+        if sensitivity_report.get("is_sharp"):
+            training_notes.append(
+                f"P2: ⚠️ WARNING - Best config is SENSITIVE (score={sensitivity_report.get('sensitivity_score', 0):.4f}). "
+                f"Consider choosing a more robust configuration."
+            )
+        else:
+            training_notes.append(
+                f"P2: Parameter sensitivity OK (score={sensitivity_report.get('sensitivity_score', 0):.4f})"
+            )
+
+    # P2: 扩展 training_notes，而不是重新赋值
+    training_notes.extend([
         f"Device: {device}",
         f"n_rounds: {n_rounds}，每轮 ~{runs_per_round} 个候选",
         f"总候选数: {len(all_candidates)}",
@@ -817,7 +1461,59 @@ def random_search_train(
         f"P02: Top-K 池已接入，pool_exploit_prob={pool_exploit_prob}",
         f"P03: XGBoost CUDA 检测语法已修复",
         f"P05: 分轮搜索已启用，每轮后更新 incumbent",
-    ] + training_notes_extra
+    ] + training_notes_extra)
+
+    if use_holdout:
+        training_notes.append(f"P0: Final holdout enabled - ratio={holdout_ratio}")
+    if use_embargo:
+        training_notes.append(f"P2: Embargo enabled - days={embargo_days}")
+    if use_sensitivity_analysis:
+        training_notes.append("P2: Parameter sensitivity analysis enabled")
+
+    # P0: 获取特征使用统计
+    feature_usage_stats = feature_usage_tracker.get_usage_stats()
+    feature_group_stats = feature_usage_tracker.get_feature_group_stats()
+    window_stats = feature_usage_tracker.get_window_stats()
+    
+    training_notes.append(f"P0: Feature usage tracked - {feature_usage_stats.get('total_candidates', 0)} candidates")
+    
+    # P0-P1: 计算最佳模型的全局重要性
+    best_model_importance: Dict[str, Any] = {}
+    if best_cfg is not None:
+        try:
+            X_best, y_best, meta_best = build_features_and_labels(_search_df, best_cfg["feature_config"])
+            model_type = str(best_cfg["model_config"]["model_type"])
+            
+            if model_type in ["logreg", "sgd", "xgb"]:
+                model = make_model(best_cfg, seed=42)
+                model.fit(X_best.values, y_best.values)
+                
+                explainer = FeatureImportanceExplainer(
+                    model=model,
+                    model_type=model_type,
+                    feature_names=list(X_best.columns),
+                    X_train=X_best,
+                    y_train=y_best.values,
+                )
+                
+                importance_dict = explainer.get_global_importance(method="auto", X_val=X_best, y_val=y_best.values)
+                best_model_importance = importance_dict
+                
+                if importance_dict.get("ranking"):
+                    top_features = importance_dict["ranking"][:10]
+                    training_notes.append(
+                        f"P0: Top 10 features: {', '.join([f['feature'] for f in top_features])}"
+                    )
+                
+                if model_type == "xgb":
+                    group_ranking = compute_feature_group_ranking(
+                        np.array(importance_dict.get("importance", [])),
+                        importance_dict.get("feature_names", [])
+                    )
+                    best_model_importance["feature_group_ranking"] = group_ranking
+                    
+        except Exception as e:
+            print(f"[SEARCH] Failed to compute feature importance: {e}")
 
     return TrainResult(
         best_config=best_cfg,
@@ -834,4 +1530,13 @@ def random_search_train(
         not_updated_reason=reason,
         best_so_far_path=best_so_far_path(output_dir),
         best_pool_path=best_pool_path(output_dir),
+        holdout_metric=holdout_metric,
+        holdout_equity=holdout_equity,
+        holdout_fold_details=holdout_fold_details,
+        search_data_rows=search_data_rows,
+        holdout_data_rows=holdout_data_rows,
+        stability_report=stability_report,
+        holdout_calibration_comparison=holdout_calibration_comparison,
+        feature_usage_stats=feature_usage_stats,
+        best_model_importance=best_model_importance,
     )

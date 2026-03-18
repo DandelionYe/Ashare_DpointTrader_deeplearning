@@ -119,6 +119,15 @@ dpoint_updater.py               独立工具：在新数据上重训并导出 Dp
 - **止盈 / 止损** — 可选，按比例触发
 - **Buy & Hold 基准** — 同期买入持有净值，用于估算 alpha
 
+### 执行层 (P0 功能)
+- **滑点模型**: 固定 20 bps (0.2%) 滑点
+- **涨跌停处理**: 涨停不能买，跌停不能卖
+- **停牌处理**: 停牌时订单被拒绝
+- **ST 股过滤**: 可选过滤 ST 股票
+- **上市天数过滤**: 最少 60 个交易日上市要求
+- **成交量过滤**: 最少日成交额要求（默认 100 万元）
+- **执行统计**: 记录订单提交/成交/拒绝原因/滑点成本
+
 ---
 
 ## 项目结构
@@ -135,12 +144,33 @@ dpoint_updater.py               独立工具：在新数据上重训并导出 Dp
 │
 ├── search_engine.py        随机搜索：探索 / 精细化 / 池采样 三模式轮次
 ├── trainer_optimizer.py    公开训练 API；全样本最终拟合
-├── splitter.py             Walk-Forward 切分 + 自适应折数推算
-├── metrics.py              几何均值比率；交易次数惩罚项
-├── backtester_engine.py    A 股事件驱动回测引擎
+├── splitter.py             Walk-Forward 切分 + 自适应折数 + Final Holdout
+├── metrics.py              几何均值比率；交易次数惩罚项 + 完整风险指标
+├── backtester_engine.py   A 股事件驱动回测引擎 + 执行层
+├── calibration.py          概率校准（Platt、Isotonic、Brier Score、ECE/MCE）
+├── explainer.py            特征重要性（树模型、排列重要性、SHAP）& 使用跟踪
+├── regime.py               市场状态检测与分层分析
+├── rolling_trainer.py      滚动再训练调度器（扩展/滚动窗口）
 ├── persistence.py          best_so_far.json / best_pool.json 读写
-├── reporter.py             Excel 工作簿 + 运行配置 JSON 写入
-└── constants.py            全局常量（惩罚权重、文件名）
+├── reporter.py             Excel 工作簿 + JSON + HTML 报告
+├── html_reporter.py       HTML 仪表盘（含净值曲线、校准图）
+├── run_manifest.py         实验清单管理 & 重放
+├── repro.py                可复现性工具（种子、环境锁定）
+├── compare_runs.py        运行结果比对工具
+│
+├── constants.py            全局常量（惩罚权重、文件名）
+│
+├── tests/                 自动化测试套件
+│   ├── test_no_leakage.py    时序泄露测试
+│   ├── test_splitter.py     Walk-Forward 切分测试
+│   ├── test_execution.py    执行层测试
+│   ├── test_fee_lot.py      费用和手数测试
+│   ├── test_metrics.py      风险指标测试
+│   ├── test_smoke.py       冒烟测试
+│   ├── test_cli.py         CLI 参数测试
+│   ├── test_reproducibility.py 可复现性测试
+│   ├── test_rejection.py    订单拒绝逻辑测试
+│   └── conftest.py         测试 fixtures
 ```
 
 ---
@@ -266,6 +296,18 @@ python dpoint_updater.py --output_dir ./output
 | `--n_jobs` | `1` | 并行进程数（CUDA 启用时自动限制） |
 | `--seed` | `42` | 随机种子 |
 | `--eval_tickers` | `` | 多标的泛化评估文件路径（逗号分隔） |
+| `--use_holdout` | `1` | 启用 Final Holdout 测试 (1=是, 0=否) |
+| `--holdout_ratio` | `0.15` | Holdout 比例（默认 15%） |
+| `--use_embargo` | `0` | 启用 Embargo Gap 防止时序泄露 |
+| `--embargo_days` | `5` | Embargo 天数 |
+| `--use_sensitivity_analysis` | `1` | 启用参数敏感性分析 |
+| `--use_regime_analysis` | `0` | 启用市场状态分层分析 |
+| `--experiment_dir` | `auto` | 实验独立输出目录 |
+| `--replay` | `` | 从历史实验重放 |
+| `--rolling_mode` | `` | 滚动再训练模式: expanding, rolling |
+| `--rolling_window_length` | `None` | 滚动窗口长度（天） |
+| `--retrain_frequency` | `monthly` | 再训练频率: daily, weekly, monthly, quarterly |
+| `--export_lock` | `` | 导出环境锁定文件 |
 
 ---
 
@@ -285,17 +327,37 @@ python dpoint_updater.py --output_dir ./output
 | Sheet | 内容 |
 |---|---|
 | **Trades** | 每笔交易：买入/卖出日期、价格、盈亏、收益率、状态 |
-| **EquityCurve** | 每日净值、现金、持仓市值、最大回撤、Buy & Hold 基准曲线 |
+| **EquityCurve** | 每日净值、现金、持仓市值、最大回撤、日收益率、Buy & Hold 基准曲线 |
 | **Config** | 本次运行的全部特征 / 模型 / 交易参数 |
 | **Log** | 数据加载报告、训练摘要、每轮搜索日志 |
 | **ModelParams** | 特征系数与 Scaler 参数（仅 LogReg/SGD 模型输出） |
+| **RiskMetrics** | 完整风险指标：夏普、索提诺、卡玛、最大回撤等 |
+| **RegimeAnalysis** | 市场状态分层表现（高/低波动、牛/熊市） |
+| **RegimeStratified** | 各市场状态下的详细指标 |
+| **TradeDistribution** | 交易分布统计（盈亏、持仓天数） |
+| **CalibrationMetrics** | 概率校准结果（Brier Score、ECE、MCE） |
+| **FeatureUsage** | 搜索过程中特征组使用频率 |
+| **FeatureImportance** | 最佳模型特征重要性（树模型、排列重要性、SHAP） |
 
 ---
 
 ## 核心设计说明
 
-### Walk-Forward 时序验证
+### Walk-Forward 时序验证 + Final Holdout
 优化器使用不重叠的样本外验证窗口评估每个候选配置。训练集采用**扩展窗口**（expanding window），每折验证集严格位于训练集之后。目标指标为**各折净值比率的几何均值**，天然惩罚不稳定或高方差的策略。
+
+**多阶段验证流程：**
+1. **Search OOS**: 在搜索数据上进行 Walk-Forward 交叉验证
+2. **Selection OOS**: Top-K 候选在搜索数据上重新验证
+3. **Final Holdout OOS**: 最佳配置在完全留出的 holdout 数据上评估（默认 15%）
+
+### 多重防过拟合机制
+- **Final Holdout Split**: 留出 15% 数据作为最终测试集，搜索过程完全不接触
+- **Nested Walk-Forward**: 内层 CV 用于模型选择，外层 CV 用于性能评估
+- **Embargo Gap**: 训练集和验证集之间留出 5 天间隔，防止滚动窗口特征泄露
+- **参数敏感性分析**: 检查最优解是否过于"尖锐"
+- **多种子稳定性评估**: Top-N 候选使用多个随机种子重新评估
+- **惩罚项**: 最差折惩罚、折方差惩罚、交易次数过少惩罚
 
 ### 交易次数惩罚项
 软惩罚项抑制每折交易次数偏离目标值（`TARGET_CLOSED_TRADES_PER_FOLD`）的配置，防止优化器收敛到退化解（如从不交易或每日交易）。
@@ -319,3 +381,36 @@ python dpoint_updater.py --output_dir ./output
 - **无实盘接入** — 本项目仅为研究工具，不含委托管理、券商接口或实时行情对接。
 - **印花税税率** — 默认卖出成本使用 2023 年 8 月前的 0.10% 印花税。如需使用调整后的 0.05%，请在调用时传入 `commission_rate_sell=0.0008`。
 - **跨标的泛化评估** — `--eval_tickers` 参数采用超参迁移方式（配置不变，在目标标的上从头训练），**不迁移**模型权重。
+
+---
+
+## 高级功能
+
+### 概率校准
+系统支持概率校准以提高预测可靠性：
+- **方法**: 无、Platt Scaling、Isotonic Regression
+- **指标**: Brier Score、期望校准误差 (ECE)、最大校准误差 (MCE)
+- **验证**: 校准仅在验证集上拟合，不在测试数据上拟合
+
+### 特征重要性与可解释性
+- **特征使用跟踪**: 记录搜索过程中各特征组的使用情况
+- **树模型重要性**: XGBoost 原生特征重要性
+- **排列重要性**: 模型无关的重要性估计
+- **SHAP 值**: 用于树模型和线性模型（需安装 SHAP）
+
+### 市场状态分层分析
+- **趋势检测**: 基于均线交叉（短期 vs 长期均线）
+- **波动率状态**: 基于滚动波动率的高/中/低波动
+- **组合状态**: 趋势 × 波动率矩阵
+- **分层指标**: 按市场状态分解的性能指标
+
+### 滚动再训练
+- **窗口类型**: 扩展窗口（随时间增长）或滚动窗口（固定长度）
+- **再训练频率**: 日、周、月、季
+- **快照管理**: 跟踪模型快照以支持回滚
+
+### 可复现性
+- **全局种子**: 为 Python、NumPy、PyTorch、TensorFlow 设置种子
+- **环境锁定**: 导出 `requirements-lock.txt` 实现环境可复现
+- **实验清单**: 每次运行生成 `manifest.json` 包含完整元数据
+- **CLI 重放**: 从历史清单重放实验

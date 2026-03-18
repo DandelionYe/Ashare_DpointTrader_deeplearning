@@ -75,6 +75,51 @@ def walkforward_splits(
     return splits
 
 
+def final_holdout_split(
+    df: pd.DataFrame,
+    holdout_ratio: float = 0.15,
+    min_holdout_rows: int = 60,
+) -> Tuple[
+    pd.DataFrame,  # search_df
+    pd.DataFrame,  # holdout_df
+]:
+    """
+    P0: Final holdout split - 从数据末尾切出 holdout 集，确保搜索流程完全不接触。
+
+    三阶段验证流程：
+        1. Search OOS: walk-forward splits 在 search 数据上评估
+        2. Selection OOS: top-K 候选在 search 数据上重新验证
+        3. Final Holdout OOS: 最优配置在 holdout 集上做最终评估
+
+    参数说明：
+        holdout_ratio    : holdout 集占总数据的比例，默认 15%
+        min_holdout_rows : holdout 集最小行数，不足时抛出异常
+
+    返回：
+        (search_df, holdout_df) — 原始 DataFrame 切分结果
+        （调用处需自行调用 build_features_and_labels 生成 X, y）
+    """
+    n = len(df)
+    holdout_size = int(n * holdout_ratio)
+
+    if holdout_size < min_holdout_rows:
+        raise ValueError(
+            f"holdout_size={holdout_size} < min_holdout_rows={min_holdout_rows}. "
+            f"Increase holdout_ratio or use more data."
+        )
+
+    split_idx = n - holdout_size
+    search_df = df.iloc[:split_idx].copy()
+    holdout_df = df.iloc[split_idx:].copy()
+
+    print(
+        f"[INFO] P0 Final Holdout Split: search={len(search_df)} rows, "
+        f"holdout={len(holdout_df)} rows ({holdout_ratio*100:.1f}%)"
+    )
+
+    return search_df, holdout_df
+
+
 def recommend_n_folds(
     n_samples: int,
     train_start_ratio: float = 0.5,
@@ -131,3 +176,163 @@ def recommend_n_folds(
         break
 
     return max(min_folds, min(max_folds, best_n))
+
+
+# =========================================================
+# P2: Nested Walk-Forward（防止模型选择时的前向偏差）
+# =========================================================
+def nested_walkforward_splits(
+    X: pd.DataFrame,
+    y: pd.Series,
+    n_outer_folds: int = 3,
+    n_inner_folds: int = 2,
+    train_start_ratio: float = 0.5,
+    min_rows: int = 60,
+    embargo_days: int = 5,
+) -> List[Tuple[
+    Tuple[pd.DataFrame, pd.Series],  # outer_train
+    Tuple[pd.DataFrame, pd.Series],  # outer_val
+    List[Tuple[Tuple[pd.DataFrame, pd.Series], Tuple[pd.DataFrame, pd.Series]]],  # inner_splits
+]]:
+    """
+    P2: 嵌套 Walk-Forward 切分。
+
+    与普通 walk-forward 的区别：
+        - 外层：标准的 walk-forward split（训练集扩展到当前点，验证集下一段）
+        - 内层：在外层训练集上再做一次 walk-forward，用于模型选择/超参调优
+        - 这样可以避免"用验证集选择模型，再用同一验证集评估模型"的前向偏差
+
+    另外增加了 embargo_days：
+        - 在训练集和验证集之间留出 gap，防止特征工程中的滚动窗口
+          （如 moving average）导致的信息泄露
+
+    参数说明：
+        n_outer_folds    : 外层折数，默认 3
+        n_inner_folds    : 内层折数，默认 2（在外层训练集上）
+        train_start_ratio: 外层初始训练集比例
+        min_rows         : 最小行数约束
+        embargo_days     : 训练集和验证集之间的 embargo 天数
+
+    返回：
+        List[(
+            (outer_train_X, outer_train_y),
+            (outer_val_X, outer_val_y),
+            [inner_splits...]
+        )]
+    """
+    n = len(X)
+    cuts = [
+        train_start_ratio + (1.0 - train_start_ratio) * i / n_outer_folds
+        for i in range(n_outer_folds + 1)
+    ]
+
+    splits = []
+    for k in range(len(cuts) - 1):
+        outer_train_end = int(n * cuts[k])
+        outer_val_end = int(n * cuts[k + 1])
+
+        # 应用 embargo：验证集向后推移
+        outer_val_start = outer_train_end + embargo_days
+        if outer_val_start >= outer_val_end:
+            print(f"[WARN] nested_walkforward: fold {k+1} skipped due to embargo_days={embargo_days}")
+            continue
+
+        X_outer_train = X.iloc[:outer_train_end]
+        y_outer_train = y.iloc[:outer_train_end]
+        X_outer_val = X.iloc[outer_val_start:outer_val_end]
+        y_outer_val = y.iloc[outer_val_start:outer_val_end]
+
+        if len(X_outer_train) < min_rows or len(X_outer_val) < min_rows:
+            print(f"[WARN] nested_walkforward: fold {k+1} skipped (train={len(X_outer_train)}, val={len(X_outer_val)})")
+            continue
+
+        # 内层 walk-forward：在外层训练集上做
+        inner_cuts = [
+            1.0 * i / n_inner_folds
+            for i in range(n_inner_folds + 1)
+        ]
+        inner_splits = []
+        for j in range(len(inner_cuts) - 1):
+            inner_train_end = int(len(X_outer_train) * inner_cuts[j])
+            inner_val_end = int(len(X_outer_train) * inner_cuts[j + 1])
+
+            if inner_train_end < min_rows or (inner_val_end - inner_train_end) < min_rows:
+                continue
+
+            X_inner_train = X_outer_train.iloc[:inner_train_end]
+            y_inner_train = y_outer_train.iloc[:inner_train_end]
+            X_inner_val = X_outer_train.iloc[inner_train_end:inner_val_end]
+            y_inner_val = y_outer_train.iloc[inner_train_end:inner_val_end]
+
+            inner_splits.append(((X_inner_train, y_inner_train), (X_inner_val, y_inner_val)))
+
+        if not inner_splits:
+            print(f"[WARN] nested_walkforward: fold {k+1} skipped (no valid inner splits)")
+            continue
+
+        splits.append((
+            (X_outer_train, y_outer_train),
+            (X_outer_val, y_outer_val),
+            inner_splits
+        ))
+
+    if not splits:
+        print(f"[WARN] nested_walkforward: ALL {n_outer_folds} folds skipped.")
+    return splits
+
+
+# =========================================================
+# P2: Embargo Gap Walk-Forward（带 embargo 的标准 walk-forward）
+# =========================================================
+def walkforward_splits_with_embargo(
+    X: pd.DataFrame,
+    y: pd.Series,
+    n_folds: int = 4,
+    train_start_ratio: float = 0.5,
+    min_rows: int = 60,
+    embargo_days: int = 5,
+) -> List[Tuple[Tuple[pd.DataFrame, pd.Series], Tuple[pd.DataFrame, pd.Series]]]:
+    """
+    P2: 带 embargo 的 Walk-Forward 切分。
+
+    在标准 walk-forward 基础上增加 embargo_days：
+        - 训练集和验证集之间留出 gap
+        - 防止滚动窗口特征（如 MA、RSI 等）导致的信息泄露
+
+    参数说明：
+        embargo_days : 训练集和验证集之间的 embargo 天数，默认 5 天
+
+    切分示意（n_folds=4, train_start_ratio=0.5, embargo_days=5）：
+        折1: train=[0%~50%]   val=[50%+5天~62.5%]
+        折2: train=[0%~62%]   val=[62%+5天~75%]
+        ...
+    """
+    n = len(X)
+    cuts = [
+        train_start_ratio + (1.0 - train_start_ratio) * i / n_folds
+        for i in range(n_folds + 1)
+    ]
+
+    splits = []
+    for k in range(len(cuts) - 1):
+        train_end = int(n * cuts[k])
+        val_end = int(n * cuts[k + 1])
+
+        # 应用 embargo
+        val_start = train_end + embargo_days
+        if val_start >= val_end:
+            print(f"[WARN] walkforward_splits_with_embargo: fold {k+1} skipped (embargo={embargo_days})")
+            continue
+
+        X_train, y_train = X.iloc[:train_end], y.iloc[:train_end]
+        X_val, y_val = X.iloc[val_start:val_end], y.iloc[val_start:val_end]
+
+        if len(X_train) < min_rows or len(X_val) < min_rows:
+            print(f"[WARN] walkforward_splits_with_embargo: fold {k+1} skipped (train={len(X_train)}, val={len(X_val)})")
+            continue
+
+        splits.append(((X_train, y_train), (X_val, y_val)))
+
+    if not splits:
+        print(f"[WARN] walkforward_splits_with_embargo: ALL {n_folds} folds skipped.")
+    return splits

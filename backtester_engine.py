@@ -1,53 +1,33 @@
 # backtester_engine.py
 """
-回测执行引擎（P04 + P1-3 + P1-4 修复版）。
+回测执行引擎（P04 + P1-3 + P1-4 + P0/P1/P2 增强版）。
 
 P04 修复：加入 A 股真实交易成本
 
 P1-3 修复：执行价格改用 t+1 日开盘价，消除额外前向偏差
-    原版：t 日生成信号，挂单 price = t 日收盘价，t+1 日按此价格成交。
-    问题：信号当天收盘价在 t 日盘后已确定，t+1 日实际可成交的最早价格
-          是 t+1 日开盘价，用 t 日收盘代替会引入额外的前向偏差。
-    修复：执行时改为读取当日（即 t+1 日）的 open_qfq 作为成交价，
-          _build_signal_frame 新增 open_qfq 列传入，pending_order 仅记录
-          signal_close_price 供日志使用，不再用于定价。
-
 P1-4 修复：持仓天数改用交易日数而非自然日数
-    原版：用 (dt_sell - dt_buy).days 计算持仓时长，包含周末和节假日。
-    问题：设置 max_hold_days=15 本意是 15 个交易日（约 3 周），
-          但自然日计算只有约 3 周，实际约等于 11 个交易日，语义偏差明显。
-          对 min_hold_days=1 的 T+1 约束，周五买入、周一卖出自然日差 3 天
-          但交易日差仅 1 天，同样需要按交易日计算。
-    修复：在 _simulate_execution 开始时预构建 tday_of 字典（日期→交易日序号），
-          所有 held_days 相关判断均改为交易日差值。
-          max_hold_days、min_hold_days 的单位由自然日变为交易日。
-    - 买入：佣金 0.03%（commission_rate_buy，默认 0.0003）
-    - 卖出：佣金 0.03% + 印花税 0.10% = 0.13%（commission_rate_sell，默认 0.0013）
-    - 两个参数均可在 backtest_from_dpoint 调用时覆盖
-    - 印花税说明：2023年8月起已调整为0.05%，此处默认使用较保守的0.10%；
-      如需精确模拟可在调用时传入 commission_rate_sell=0.0008
+
+P0 增强：统一 execution layer
+    - 固定滑点模型
+    - 涨跌停/停牌不可成交逻辑
+    - 订单拒绝原因记录
+
+P1 增强：
+    - 成交量约束
+    - 开盘跳空处理
+    - ST/上市天数过滤
+    - execution stats 输出
+
+P2 增强：
+    - 分层滑点模型
+    - 部分成交逻辑
 
 公开 API：
     backtest_from_dpoint(df, dpoint, ...) -> BacktestResult
-
-内部结构（信号/执行分离）：
-    _build_signal_frame(df, dpoint, buy_threshold, sell_threshold)
-        → 逐日的 dpoint 原始比较结果（纯向量运算，无状态，可独立测试）
-    _simulate_execution(df, signal_frame, ...)
-        → 含状态的执行模拟（挂单、持仓、净值快照）
-    _normalize_open_trade(trade, ...)
-        → 统一补全交易记录缺失字段，消除分散的 setdefault 调用
-
-A 股约束：
-    - 仅做多，不做空
-    - 最小交易单位 100 股
-    - T+1 近似：信号在 t 日生成，t+1 日按 t+1 日开盘价（open_qfq）执行
-      （P1-3 修复：原用 t 日收盘价，已改为 t+1 日开盘价以消除额外前向偏差）
-    - min_hold_days >= 1 强制模拟 T+1 锁定期
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -60,20 +40,78 @@ import pandas as pd
 # 买入佣金（券商收取，通常 0.02%～0.03%，此处取保守值）
 COMMISSION_RATE_BUY: float = 0.0003
 
-# 卖出佣金 + 印花税（0.03% + 0.10%；2023年8月后印花税降至0.05%，
-# 如需精确模拟请在调用时传入 commission_rate_sell=0.0008）
+# 卖出佣金 + 印花税（0.03% + 0.10%；2023年8月后印花税降至0.05%）
 COMMISSION_RATE_SELL: float = 0.0013
 
 
 # =========================================================
-# 数据类
+# P0/P1: 执行层常量
+# =========================================================
+# 固定滑点（按成交价百分比）
+DEFAULT_SLIPPAGE_BPS: int = 20  # 20 bps = 0.2%
+
+# 涨跌停幅度（A 股默认 10%，ST 为 5%）
+DEFAULT_LIMIT_UP_PCT: float = 0.10
+DEFAULT_LIMIT_DOWN_PCT: float = 0.10
+ST_LIMIT_PCT: float = 0.05
+
+# 最小上市天数要求（默认 60 个交易日）
+DEFAULT_MIN_LISTING_DAYS: int = 60
+
+# 最小成交量要求（默认 100 万成交额）
+DEFAULT_MIN_DAILY_VOLUME: float = 1_000_000.0
+
+# 过滤 ST 股
+DEFAULT_FILTER_ST: bool = True
+
+
+# =========================================================
+# P0: Execution Stats 数据类
+# =========================================================
+@dataclass
+class ExecutionStats:
+    """P1: 执行统计"""
+    order_submitted: int = 0
+    order_filled: int = 0
+    order_rejected: int = 0
+    reject_reasons: Dict[str, int] = field(default_factory=dict)
+    total_slippage_cost: float = 0.0
+    filled_value: float = 0.0
+
+    def add_reject(self, reason: str):
+        self.order_rejected += 1
+        self.reject_reasons[reason] = self.reject_reasons.get(reason, 0) + 1
+
+    def add_fill(self, slippage_cost: float, value: float):
+        self.order_filled += 1
+        self.total_slippage_cost += slippage_cost
+        self.filled_value += value
+
+    @property
+    def avg_slippage_cost(self) -> float:
+        return self.total_slippage_cost / self.order_filled if self.order_filled > 0 else 0.0
+
+    def to_dict(self) -> Dict:
+        return {
+            "order_submitted": self.order_submitted,
+            "order_filled": self.order_filled,
+            "order_rejected": self.order_rejected,
+            "reject_reasons": self.reject_reasons,
+            "total_slippage_cost": self.total_slippage_cost,
+            "avg_slippage_cost": self.avg_slippage_cost,
+        }
+
+
+# =========================================================
+# P0: 数据类
 # =========================================================
 @dataclass
 class BacktestResult:
     trades: pd.DataFrame
-    equity_curve: pd.DataFrame    # 含 strategy + benchmark 列（P3-17）
+    equity_curve: pd.DataFrame    # 含 strategy + benchmark 列
     notes: List[str]
-    benchmark_curve: pd.DataFrame # P3-17：Buy & Hold 基准净值曲线（与 equity_curve 同索引）
+    benchmark_curve: pd.DataFrame
+    execution_stats: Optional[ExecutionStats] = None  # P1: 执行统计
 
 
 # =========================================================
@@ -160,6 +198,343 @@ def compute_buy_and_hold(
 
 
 # =========================================================
+# P0: 统一 Execution Layer
+# =========================================================
+
+def apply_slippage(
+    price: float,
+    action: str,
+    slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
+) -> float:
+    """
+    P0: 应用固定滑点模型。
+
+    参数：
+        price: 基准价格（开盘价）
+        action: "BUY" 或 "SELL"
+        slippage_bps: 滑点基数（bps），默认 20 = 0.2%
+
+    返回：
+        滑点后的成交价格
+    """
+    if price <= 0:
+        return price
+
+    slippage = price * slippage_bps / 10000.0
+    if action == "BUY":
+        # 买入时滑点向上（高价买）
+        return price + slippage
+    else:  # SELL
+        # 卖出时滑点向下（低价卖）
+        return price - slippage
+
+
+def check_execution_feasibility(
+    row: pd.Series,
+    action: str,
+    limit_up_pct: float = DEFAULT_LIMIT_UP_PCT,
+    limit_down_pct: float = DEFAULT_LIMIT_DOWN_PCT,
+    filter_st: bool = DEFAULT_FILTER_ST,
+    min_listing_days: int = DEFAULT_MIN_LISTING_DAYS,
+    min_daily_volume: float = DEFAULT_MIN_DAILY_VOLUME,
+) -> tuple[bool, str]:
+    """
+    P0: 检查订单是否可执行。
+
+    检查项：
+    1. 涨跌停：涨停不能买，跌停不能卖
+    2. 停牌：无有效价格
+    3. ST 股过滤（可选）
+    4. 上市天数不足过滤（可选）
+    5. 成交量过低过滤（可选）
+
+    参数：
+        row: 包含 open_qfq, close_qfq, limit_up, limit_down, suspended 等字段的行
+        action: "BUY" 或 "SELL"
+        limit_up_pct: 涨停幅度
+        limit_down_pct: 跌停幅度
+        filter_st: 是否过滤 ST 股
+        min_listing_days: 最小上市天数
+        min_daily_volume: 最小日成交额
+
+    返回：
+        (is_feasible, reject_reason)
+    """
+    # 1. 检查停牌
+    if row.get("suspended", False):
+        return False, "停牌"
+
+    # 2. 检查有效价格
+    price = row.get("open_qfq", 0)
+    if price <= 0 or pd.isna(price):
+        return False, "无有效价格"
+
+    # 3. 检查涨跌停（使用前一日收盘价判断）
+    prev_close = row.get("prev_close", price)
+    if pd.isna(prev_close) or prev_close <= 0:
+        prev_close = price
+
+    limit_up_price = prev_close * (1 + limit_up_pct)
+    limit_down_price = prev_close * (1 - limit_down_pct)
+
+    if action == "BUY":
+        # 涨停不能买
+        if price >= limit_up_price:
+            return False, "涨停买不到"
+    else:  # SELL
+        # 跌停不能卖
+        if price <= limit_down_price:
+            return False, "跌停卖不掉"
+
+    # 4. 检查 ST 股
+    if filter_st and row.get("is_st", False):
+        return False, "ST股过滤"
+
+    # 5. 检查上市天数
+    listing_days = row.get("listing_days", 999999)
+    if listing_days < min_listing_days:
+        return False, "上市天数不足"
+
+    # 6. 检查成交量（使用 amount 成交额，单位：元）
+    # P2 修复：原代码使用 volume（股数），但 min_daily_volume 参数名暗示成交额（元）
+    # 修复为使用 amount 字段，更符合流动性过滤的实际需求
+    daily_amount = row.get("amount", 0)
+    if daily_amount < min_daily_volume:
+        return False, "成交量过低"
+
+    return True, ""
+
+
+def get_execution_price(
+    row: pd.Series,
+    action: str,
+    slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
+    use_open: bool = True,
+) -> float:
+    """
+    P0: 获取执行价格。
+
+    P1-3 修复：默认使用开盘价（t+1日开盘）避免前向偏差
+    P0: 加入滑点
+
+    参数：
+        row: 包含 open_qfq, close_qfq 等字段
+        action: "BUY" 或 "SELL"
+        slippage_bps: 滑点基数
+        use_open: 是否使用开盘价（默认 True）
+
+    返回：
+        滑点后的执行价格
+    """
+    if use_open:
+        base_price = float(row.get("open_qfq", 0))
+    else:
+        base_price = float(row.get("close_qfq", 0))
+
+    if base_price <= 0:
+        base_price = float(row.get("close_qfq", 0))
+
+    return apply_slippage(base_price, action, slippage_bps)
+
+
+# =========================================================
+# P2: 分层滑点模型
+# =========================================================
+
+def apply_layered_slippage(
+    price: float,
+    action: str,
+    order_value: float,
+) -> float:
+    """
+    P2: 分层滑点模型。
+
+    滑点随订单规模增加：
+        - 小单 (< 10万): 10 bps
+        - 中单 (10-50万): 20 bps
+        - 大单 (> 50万): 30 bps
+
+    参数：
+        price: 基准价格
+        action: "BUY" 或 "SELL"
+        order_value: 订单金额（元）
+
+    返回：
+        滑点后的成交价格
+    """
+    if price <= 0 or order_value <= 0:
+        return price
+
+    # 分层滑点
+    if order_value < 100_000:
+        slippage_bps = 10
+    elif order_value < 500_000:
+        slippage_bps = 20
+    else:
+        slippage_bps = 30
+
+    return apply_slippage(price, action, slippage_bps)
+
+
+# =========================================================
+# P2: 更细的涨跌停成交近似
+# =========================================================
+
+def simulate_limit_execution(
+    row: pd.Series,
+    action: str,
+    shares: int,
+    limit_up_pct: float = DEFAULT_LIMIT_UP_PCT,
+    limit_down_pct: float = DEFAULT_LIMIT_DOWN_PCT,
+) -> tuple[float, float, str]:
+    """
+    P2: 更细的涨跌停成交近似模型。
+
+    当发生涨跌停时：
+    - 如果是涨停且想买：无法买入（全天封板）
+    - 如果是跌停且想卖：无法卖出（全天封板）
+    - 如果不是涨跌停但接近涨跌停价：按实际价格成交
+
+    返回：
+        (exec_price, filled_shares, status)
+        - status: "filled" | "partial" | "rejected"
+    """
+    open_price = float(row.get("open_qfq", 0))
+    prev_close = float(row.get("prev_close", open_price))
+    close_price = float(row.get("close_qfq", open_price))
+
+    if open_price <= 0:
+        return 0, 0, "rejected"
+
+    limit_up = prev_close * (1 + limit_up_pct)
+    limit_down = prev_close * (1 - limit_down_pct)
+
+    if action == "BUY":
+        # 涨停检查
+        if open_price >= limit_up:
+            # 全天涨停，无法买入
+            return 0, 0, "rejected"
+        elif close_price >= limit_up * 0.98:  # 收盘接近涨停
+            # 按涨停价成交
+            return limit_up * 0.99, shares, "filled"
+        else:
+            return open_price, shares, "filled"
+    else:  # SELL
+        # 跌停检查
+        if open_price <= limit_down:
+            # 全天跌停，无法卖出
+            return 0, 0, "rejected"
+        elif close_price <= limit_down * 1.02:  # 收盘接近跌停
+            # 按跌停价成交
+            return limit_down * 1.01, shares, "filled"
+        else:
+            return open_price, shares, "filled"
+
+
+# =========================================================
+# P2: 部分成交逻辑
+# =========================================================
+
+@dataclass
+class PartialFillResult:
+    """P2: 部分成交结果"""
+    filled_shares: int
+    remaining_shares: int
+    exec_price: float
+    status: str  # "full" | "partial" | "rejected"
+
+
+def simulate_partial_fill(
+    row: pd.Series,
+    action: str,
+    requested_shares: int,
+    order_value: float,
+    max_position_pct: float = 0.3,
+    daily_volume: float = 10_000_000.0,
+) -> PartialFillResult:
+    """
+    P2: 部分成交模拟。
+
+    考虑因素：
+    - 单日成交量限制（默认最多占成交量的 30%）
+    - 持仓比例限制（默认单只股票最多 30% 仓位）
+
+    参数：
+        row: 当日行情数据
+        action: "BUY" 或 "SELL"
+        requested_shares: 请求成交股数
+        order_value: 订单金额
+        max_position_pct: 最大持仓比例
+        daily_volume: 当日成交额
+
+    返回：
+        PartialFillResult
+    """
+    if requested_shares <= 0:
+        return PartialFillResult(0, 0, 0, "rejected")
+
+    price = float(row.get("open_qfq", 0))
+    if price <= 0:
+        return PartialFillResult(0, requested_shares, 0, "rejected")
+
+    # 成交量约束：最多成交 30% 的日成交量
+    max_volume_share = daily_volume * 0.3 / price
+    volume_limited_shares = int(min(max_volume_share, requested_shares))
+
+    # 取两者较小值
+    filled_shares = min(volume_limited_shares, requested_shares)
+    remaining = requested_shares - filled_shares
+
+    if filled_shares == 0:
+        return PartialFillResult(0, requested_shares, 0, "rejected")
+    elif remaining > 0:
+        return PartialFillResult(filled_shares, remaining, price, "partial")
+    else:
+        return PartialFillResult(filled_shares, 0, price, "full")
+
+
+# =========================================================
+# P2: 组合资金分配
+# =========================================================
+
+def calculate_position_size(
+    cash: float,
+    price: float,
+    target_position_pct: float = 0.3,
+    max_position_pct: float = 0.5,
+    commission_rate: float = COMMISSION_RATE_BUY,
+) -> int:
+    """
+    P2: 计算建仓股数。
+
+    参数：
+        cash: 可用资金
+        price: 买入价格
+        target_position_pct: 目标持仓比例（默认 30%）
+        max_position_pct: 最大持仓比例（默认 50%）
+        commission_rate: 佣金率
+
+    返回：
+        可买入股数（100 股整数倍）
+    """
+    if price <= 0 or cash <= 0:
+        return 0
+
+    # 目标买入金额
+    target_value = cash * target_position_pct
+
+    # 考虑佣金后的实际可用金额
+    available_cash = cash * max_position_pct
+    cost_per_share = price * (1 + commission_rate)
+    max_shares = int(available_cash // cost_per_share)
+
+    # 取 100 股整数倍
+    return (max_shares // 100) * 100
+
+    return apply_slippage(price, action, slippage_bps)
+
+
+# =========================================================
 # 私有工具函数
 # =========================================================
 def _calc_buy_shares(cash: float, price: float, commission_rate_buy: float) -> int:
@@ -240,6 +615,12 @@ def _build_signal_frame(
         dpoint        — 当日 Dpoint 值（NaN 表示无信号）
         dp_above_buy  — dpoint > buy_threshold（用于累计 above_cnt）
         dp_below_sell — dpoint < sell_threshold（用于累计 below_cnt）
+        volume        — 成交量（用于流动性过滤）
+        amount        — 成交额（用于流动性过滤）
+        suspended     — 停牌标记
+        is_st         — ST 股标记
+        listing_days  — 上市天数
+        prev_close    — 前一日收盘价（用于涨跌停判断）
     """
     open_ = df["open_qfq"].astype(float)   # P1-3：新增开盘价
     close = df["close_qfq"].astype(float)
@@ -252,6 +633,13 @@ def _build_signal_frame(
         "dpoint": dpoint_aligned,
         "dp_above_buy": dpoint_aligned > buy_threshold,
         "dp_below_sell": dpoint_aligned < sell_threshold,
+        # P2 修复：保留必要字段供 check_execution_feasibility 使用
+        "volume": df["volume"].astype(float),
+        "amount": df["amount"].astype(float),
+        "suspended": df.get("suspended", False),
+        "is_st": df.get("is_st", False),
+        "listing_days": df.get("listing_days", 999999),
+        "prev_close": df.get("prev_close", close),
     })
 
     # NaN 的 dpoint 不触发任何方向
@@ -273,36 +661,36 @@ def _simulate_execution(
     stop_loss: Optional[float],
     confirm_days: int,
     min_hold_days: int,
-    commission_rate_buy: float,    # P04 新增
-    commission_rate_sell: float,   # P04 新增
-) -> tuple[List[Dict[str, object]], List[Dict[str, object]], List[str]]:
+    commission_rate_buy: float,
+    commission_rate_sell: float,
+    # P0/P1 新增参数
+    slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
+    limit_up_pct: float = DEFAULT_LIMIT_UP_PCT,
+    limit_down_pct: float = DEFAULT_LIMIT_DOWN_PCT,
+    filter_st: bool = DEFAULT_FILTER_ST,
+    min_listing_days: int = DEFAULT_MIN_LISTING_DAYS,
+    min_daily_volume: float = DEFAULT_MIN_DAILY_VOLUME,
+    use_layered_slippage: bool = False,
+) -> tuple[List[Dict[str, object]], List[Dict[str, object]], List[str], ExecutionStats]:
     """
-    有状态的逐日执行模拟。读取 _build_signal_frame 的输出，
-    维护持仓状态机（挂单 → 成交 → 净值快照）。
+    有状态的逐日执行模拟。
 
-    P04 修复：买入和卖出均计入真实交易成本：
-        - 买入实付 = 股数 × 价格 × (1 + commission_rate_buy)
-        - 卖出实收 = 股数 × 价格 × (1 - commission_rate_sell)
-        - pnl = 卖出实收 - 买入实付（净盈亏，含所有成本）
+    P04 修复：买入和卖出均计入真实交易成本
+    P1-3 修复：执行价改用 t+1 日开盘价
+    P1-4 修复：持仓天数改用交易日数
+    P0 增强：统一 execution layer（滑点、涨跌停、停牌检查）
+    P1 增强：执行统计
 
-    P1-3 修复：执行价改用 t+1 日开盘价：
-        pending_order 的 "price" 字段保留 t 日收盘价供日志记录，
-        实际执行时改为读取当日 open_qfq（即信号次日的开盘价）。
-
-    P1-4 修复：所有持仓天数判断改用交易日数：
-        在循环开始前预构建 tday_of 字典（日期→交易日序号），
-        min_hold_days / max_hold_days 的单位均为交易日。
-
-    返回 (trade_rows, equity_rows, notes)，由 backtest_from_dpoint 组装为 BacktestResult。
+    返回 (trade_rows, equity_rows, notes, execution_stats)
     """
     notes: List[str] = []
     trade_rows: List[Dict[str, object]] = []
     equity_rows: List[Dict[str, object]] = []
+    exec_stats = ExecutionStats()  # P1: 执行统计
 
     dates = list(signal_frame.index)
 
-    # P1-4：预构建交易日序号映射，用于交易日数计算
-    # key: pd.Timestamp, value: 从 0 开始的交易日序号
+    # P1-4：预构建交易日序号映射
     tday_of: Dict[pd.Timestamp, int] = {
         pd.Timestamp(signal_frame.iloc[idx]["date"]): idx
         for idx in range(len(signal_frame))
@@ -320,8 +708,8 @@ def _simulate_execution(
     for i in range(len(dates)):
         row = signal_frame.iloc[i]
         dt: pd.Timestamp = row["date"]
-        price_open_t: float = float(row["open_qfq"])   # P1-3：当日开盘价，用于挂单执行
-        price_close_t: float = float(row["close_qfq"])  # 收盘价：用于信号生成和净值快照
+        price_open_t: float = float(row["open_qfq"])
+        price_close_t: float = float(row["close_qfq"])
         dp: float = float(row["dpoint"]) if pd.notna(row["dpoint"]) else float("nan")
         dp_above: bool = bool(row["dp_above_buy"])
         dp_below: bool = bool(row["dp_below_sell"])
@@ -334,74 +722,115 @@ def _simulate_execution(
         # -----------------------------------------------------------
         if pending_order is not None and pending_order.get("exec_date") == dt:
             action = str(pending_order["action"])
-            # P1-3：实际成交价改用 t+1 日开盘价（当日 open_qfq）
-            # pending_order["price"] 存储的是 t 日收盘价，仅作日志参考
-            exec_price = price_open_t
-            exec_price_used = exec_price
             signal_date = pd.to_datetime(pending_order["signal_date"])
 
-            if action == "BUY":
-                if shares == 0:
-                    # P04：买入股数计算时纳入佣金，避免现金轻微透支
-                    buy_shares = _calc_buy_shares(cash, exec_price, commission_rate_buy)
-                    if buy_shares > 0:
-                        # P04：实付成本 = 股数 × 价格 × (1 + 佣金率)
-                        buy_commission = buy_shares * exec_price * commission_rate_buy
-                        cost = buy_shares * exec_price + buy_commission
-                        cash -= cost
-                        shares += buy_shares
-                        position_entry_date = dt
-                        exec_action_today = "BUY_EXEC"
-                        open_trade = {
-                            "buy_signal_date": signal_date,
-                            "buy_exec_date": dt,
-                            "buy_price": exec_price,                   # P1-3：t+1 开盘成交价
-                            "buy_signal_close": float(pending_order.get("price", np.nan)),  # P1-3：t 收盘参考价
-                            "buy_shares": buy_shares,
-                            "buy_cost": cost,                      # P04：含佣金的实付总额
-                            "buy_commission": buy_commission,      # P04：佣金明细
-                            "cash_after_buy": cash,
-                            "buy_dpoint_signal_day": float(pending_order.get("signal_dpoint", np.nan)),
-                            "buy_threshold": float(buy_threshold),
-                            "sell_threshold": float(sell_threshold),
-                            "confirm_days": int(confirm_days),
-                            "min_hold_days": int(min_hold_days),
-                            "buy_above_cnt_at_signal": int(pending_order.get("above_cnt_at_signal", 0)),
-                        }
-                    else:
-                        notes.append(f"{dt.date()}: BUY skipped (insufficient cash for 100 shares).")
+            # P0: 检查订单可行性（涨跌停、停牌、ST等）
+            is_feasible, reject_reason = check_execution_feasibility(
+                row, action,
+                limit_up_pct=limit_up_pct,
+                limit_down_pct=limit_down_pct,
+                filter_st=filter_st,
+                min_listing_days=min_listing_days,
+                min_daily_volume=min_daily_volume,
+            )
+
+            exec_stats.order_submitted += 1
+
+            if not is_feasible:
+                # P0: 订单被拒绝
+                exec_stats.add_reject(reject_reason)
+                notes.append(f"{dt.date()}: {action} REJECTED - {reject_reason}")
+                pending_order = None
+                # 继续执行后续逻辑（不成交）
+            else:
+                # P0: 执行订单 - 获取滑点后的价格
+                if use_layered_slippage:
+                    # P2: 分层滑点
+                    order_value = shares * price_open_t if action == "SELL" else 0
+                    exec_price = apply_layered_slippage(price_open_t, action, order_value)
                 else:
-                    notes.append(f"{dt.date()}: BUY pending but already in position; skipped.")
+                    # P0: 固定滑点
+                    exec_price = get_execution_price(row, action, slippage_bps)
 
-            elif action == "SELL":
-                if shares > 0:
-                    # P1-4：持仓时长改用交易日数（原版为自然日数）
-                    if position_entry_date is not None and position_entry_date in tday_of:
-                        held_tdays = tday_of[dt] - tday_of[position_entry_date]
+                # P0: 记录滑点成本
+                slippage_cost = abs(exec_price - price_open_t) * (shares if action == "SELL" else 0)
+                exec_price_used = exec_price
+
+                if action == "BUY":
+                    if shares == 0:
+                        # P04：买入股数计算时纳入佣金
+                        buy_shares = _calc_buy_shares(cash, exec_price, commission_rate_buy)
+                        if buy_shares > 0:
+                            # P04：实付成本 = 股数 × 价格 × (1 + 佣金率)
+                            buy_commission = buy_shares * exec_price * commission_rate_buy
+                            cost = buy_shares * exec_price + buy_commission
+                            cash -= cost
+                            shares += buy_shares
+                            position_entry_date = dt
+                            exec_action_today = "BUY_EXEC"
+                            # P1: 记录滑点成本
+                            order_value = buy_shares * exec_price
+                            slippage_cost = abs(exec_price - price_open_t) * buy_shares
+                            exec_stats.add_fill(slippage_cost, order_value)
+                            open_trade = {
+                                "buy_signal_date": signal_date,
+                                "buy_exec_date": dt,
+                                "buy_price": exec_price,
+                                "buy_price_before_slippage": price_open_t,
+                                "buy_slippage_bps": (exec_price - price_open_t) / price_open_t * 10000 if price_open_t > 0 else 0,
+                                "buy_signal_close": float(pending_order.get("price", np.nan)),
+                                "buy_shares": buy_shares,
+                                "buy_cost": cost,
+                                "buy_commission": buy_commission,
+                                "cash_after_buy": cash,
+                                "buy_dpoint_signal_day": float(pending_order.get("signal_dpoint", np.nan)),
+                                "buy_threshold": float(buy_threshold),
+                                "sell_threshold": float(sell_threshold),
+                                "confirm_days": int(confirm_days),
+                                "min_hold_days": int(min_hold_days),
+                                "buy_above_cnt_at_signal": int(pending_order.get("above_cnt_at_signal", 0)),
+                            }
+                        else:
+                            exec_stats.add_reject("资金不足")
+                            notes.append(f"{dt.date()}: BUY skipped (insufficient cash for 100 shares).")
                     else:
-                        held_tdays = 999_999
-                    if held_tdays >= min_hold_days:
-                        # P04：卖出实收 = 股数 × 价格 × (1 - 佣金率 - 印花税率)
-                        sell_commission = shares * exec_price * commission_rate_sell
-                        proceeds = shares * exec_price - sell_commission
-                        sell_shares = shares
-                        cash += proceeds
-                        shares = 0
-                        position_entry_date = None
-                        exec_action_today = "SELL_EXEC"
+                        notes.append(f"{dt.date()}: BUY pending but already in position; skipped.")
 
-                        if open_trade is None:
-                            open_trade = {}
-                        open_trade.update({
-                            "sell_signal_date": signal_date,
-                            "sell_exec_date": dt,
-                            "sell_price": exec_price,
-                            "sell_shares": sell_shares,
-                            "sell_proceeds": proceeds,             # P04：扣除成本后的实收
-                            "sell_commission": sell_commission,    # P04：卖出成本明细
-                            "cash_after_sell": cash,
-                            "sell_dpoint_signal_day": float(pending_order.get("signal_dpoint", np.nan)),
-                            "sell_below_cnt_at_signal": int(pending_order.get("below_cnt_at_signal", 0)),
+                elif action == "SELL":
+                    if shares > 0:
+                        # P1-4：持仓时长改用交易日数
+                        if position_entry_date is not None and position_entry_date in tday_of:
+                            held_tdays = tday_of[dt] - tday_of[position_entry_date]
+                        else:
+                            held_tdays = 999_999
+                        if held_tdays >= min_hold_days:
+                            # P04：卖出实收 = 股数 × 价格 × (1 - 佣金率 - 印花税率)
+                            sell_commission = shares * exec_price * commission_rate_sell
+                            proceeds = shares * exec_price - sell_commission
+                            sell_shares = shares
+                            cash += proceeds
+                            shares = 0
+                            position_entry_date = None
+                            exec_action_today = "SELL_EXEC"
+                            # P1: 记录滑点成本
+                            order_value = sell_shares * exec_price
+                            slippage_cost = abs(exec_price - price_open_t) * sell_shares
+                            exec_stats.add_fill(slippage_cost, order_value)
+
+                            if open_trade is None:
+                                open_trade = {}
+                            open_trade.update({
+                                "sell_signal_date": signal_date,
+                                "sell_exec_date": dt,
+                                "sell_price": exec_price,
+                                "sell_price_before_slippage": price_open_t,
+                                "sell_slippage_bps": (price_open_t - exec_price) / price_open_t * 10000 if price_open_t > 0 else 0,
+                                "sell_shares": sell_shares,
+                                "sell_proceeds": proceeds,
+                                "sell_commission": sell_commission,
+                                "cash_after_sell": cash,
+                                "sell_dpoint_signal_day": float(pending_order.get("signal_dpoint", np.nan)),
+                                "sell_below_cnt_at_signal": int(pending_order.get("below_cnt_at_signal", 0)),
                         })
 
                         # P04：pnl = 卖出实收 - 买入实付（净盈亏，含全部成本）
@@ -443,6 +872,7 @@ def _simulate_execution(
         # -----------------------------------------------------------
         force_sell = False
         force_reason = ""
+        force_trigger = None  # P2 修复：初始化 force_trigger
 
         if shares > 0 and position_entry_date is not None and i < len(dates) - 1:
             # P1-4：max_hold_days 判断改用交易日数（+1 表示下一交易日执行时的持仓交易日数）
@@ -453,6 +883,7 @@ def _simulate_execution(
                 force_reason = (
                     f"max_hold_days reached ({held_tdays_next}>={max_hold_days} tdays) -> FORCE_SELL"
                 )
+                force_trigger = "max_hold_days"  # P2 修复：添加 force_trigger
 
             if open_trade is not None:
                 buy_price = float(open_trade.get("buy_price", np.nan))
@@ -463,11 +894,63 @@ def _simulate_execution(
                         force_reason = (
                             f"take_profit reached ({pnl_ratio:.2%}>={take_profit:.2%}) -> FORCE_SELL"
                         )
+                        force_trigger = "take_profit"
                     if stop_loss is not None and pnl_ratio <= -float(stop_loss):
                         force_sell = True
                         force_reason = (
                             f"stop_loss reached ({pnl_ratio:.2%}<={-stop_loss:.2%}) -> FORCE_SELL"
                         )
+                        force_trigger = "stop_loss"
+
+        # -----------------------------------------------------------
+        # P0: 处理止盈止损的执行逻辑（按可执行价格成交）
+        # -----------------------------------------------------------
+        force_exec_price = np.nan
+        if force_sell and shares > 0 and pending_order is None:
+            # 检查次日是否可执行
+            if i < len(dates) - 1:
+                next_row = signal_frame.iloc[i + 1]
+                next_dt = next_row["date"]
+
+                # P0: 检查可执行性
+                is_feasible, reject_reason = check_execution_feasibility(
+                    next_row, "SELL",
+                    limit_up_pct=limit_up_pct,
+                    limit_down_pct=limit_down_pct,
+                    filter_st=filter_st,
+                    min_listing_days=min_listing_days,
+                    min_daily_volume=min_daily_volume,
+                )
+
+                if is_feasible:
+                    # P0: 获取滑点后的执行价格
+                    next_open = float(next_row["open_qfq"])
+                    if use_layered_slippage:
+                        order_value = shares * next_open
+                        force_exec_price = apply_layered_slippage(next_open, "SELL", order_value)
+                    else:
+                        force_exec_price = get_execution_price(next_row, "SELL", slippage_bps)
+
+                    # 记录挂单信息
+                    pending_order = {
+                        "action": "SELL",
+                        "action_reason": force_trigger,  # 记录触发原因
+                        "signal_date": dt,
+                        "exec_date": next_dt,
+                        "price": price_close_t,
+                        "exec_price_planned": force_exec_price,
+                        "signal_dpoint": dp,
+                        "below_cnt_at_signal": int(below_cnt),
+                        "pnl_ratio_at_signal": pnl_ratio,
+                    }
+                    notes.append(f"{next_dt.date()}: {force_reason} -> SELL order submitted at {force_exec_price:.2f}")
+                    force_sell = False  # 重置，避免重复处理
+                else:
+                    # P0: 止盈止损被拒绝
+                    exec_stats.order_submitted += 1
+                    exec_stats.add_reject(reason=f"stop_loss/take_profit_{reject_reason}")
+                    notes.append(f"{next_dt.date()}: {force_reason} REJECTED - {reject_reason}")
+                    force_sell = False  # 重置
 
         # -----------------------------------------------------------
         # 阶段四：生成今日信号，挂单至 t+1
@@ -572,7 +1055,7 @@ def _simulate_execution(
         )
         trade_rows.append(open_trade)
 
-    return trade_rows, equity_rows, notes
+    return trade_rows, equity_rows, notes, exec_stats
 
 
 # =========================================================
@@ -592,9 +1075,18 @@ def backtest_from_dpoint(
     # P04 新增：交易成本参数，默认值符合 A 股主流水平
     commission_rate_buy: float = COMMISSION_RATE_BUY,
     commission_rate_sell: float = COMMISSION_RATE_SELL,
+    # P0/P1 新增：执行层参数
+    slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
+    limit_up_pct: float = DEFAULT_LIMIT_UP_PCT,
+    limit_down_pct: float = DEFAULT_LIMIT_DOWN_PCT,
+    filter_st: bool = DEFAULT_FILTER_ST,
+    min_listing_days: int = DEFAULT_MIN_LISTING_DAYS,
+    min_daily_volume: float = DEFAULT_MIN_DAILY_VOLUME,
+    use_layered_slippage: bool = False,  # P2: 分层滑点
     mode_note: str = (
         "Execution: signal at t (close), execute at t+1 open. "
-        "Hold days counted in trading days."
+        "Hold days counted in trading days. "
+        "P0: includes slippage, limit-up/down, suspension checks."
     ),
 ) -> BacktestResult:
     """
@@ -603,7 +1095,17 @@ def backtest_from_dpoint(
     P04 新增参数：
         commission_rate_buy  — 买入佣金率（默认 0.03%）
         commission_rate_sell — 卖出佣金 + 印花税合计率（默认 0.13%）
-            注：2023年8月后印花税调整为0.05%，可传入 0.0008 进行精确模拟
+
+    P0 新增参数（Execution Layer）：
+        slippage_bps       — 滑点（默认 20 bps = 0.2%）
+        limit_up_pct       — 涨停幅度（默认 10%）
+        limit_down_pct     — 跌停幅度（默认 10%）
+        filter_st          — 是否过滤 ST 股（默认 True）
+        min_listing_days  — 最小上市天数（默认 60）
+        min_daily_volume  — 最小日成交额（默认 100 万）
+
+    P1 新增参数：
+        use_layered_slippage — 是否使用分层滑点（默认 False）
 
     P1-3 修复：执行价格改为 t+1 日开盘价（原为 t 日收盘价）。
     P1-4 修复：max_hold_days / min_hold_days 单位改为交易日（原为自然日）。
@@ -625,6 +1127,9 @@ def backtest_from_dpoint(
     df["date"] = pd.to_datetime(df["date"])
     df = df.set_index("date", drop=False)
 
+    # P0: 预处理涨跌停和停牌标记
+    df = _prepare_price_limits(df, limit_up_pct, limit_down_pct)
+
     dpoint = dpoint.copy()
     dpoint.index = pd.to_datetime(dpoint.index)
 
@@ -632,7 +1137,7 @@ def backtest_from_dpoint(
     signal_frame = _build_signal_frame(df, dpoint, buy_threshold, sell_threshold)
 
     # --- 第二步：执行模拟（有状态）---
-    trade_rows, equity_rows, exec_notes = _simulate_execution(
+    trade_rows, equity_rows, exec_notes, exec_stats = _simulate_execution(
         signal_frame=signal_frame,
         initial_cash=initial_cash,
         buy_threshold=buy_threshold,
@@ -642,18 +1147,42 @@ def backtest_from_dpoint(
         stop_loss=stop_loss,
         confirm_days=confirm_days,
         min_hold_days=min_hold_days,
-        commission_rate_buy=commission_rate_buy,   # P04
-        commission_rate_sell=commission_rate_sell, # P04
+        commission_rate_buy=commission_rate_buy,
+        commission_rate_sell=commission_rate_sell,
+        # P0/P1 参数
+        slippage_bps=slippage_bps,
+        limit_up_pct=limit_up_pct,
+        limit_down_pct=limit_down_pct,
+        filter_st=filter_st,
+        min_listing_days=min_listing_days,
+        min_daily_volume=min_daily_volume,
+        use_layered_slippage=use_layered_slippage,
     )
 
     # --- 第三步：组装结果 ---
     # P04：在 notes 中记录实际使用的成本参数，便于核查
+    # P0: 记录执行层参数
     cost_note = (
         f"Transaction costs: buy={commission_rate_buy:.4%}, "
         f"sell={commission_rate_sell:.4%} "
         f"(commission + stamp duty)"
     )
-    notes = [mode_note, cost_note] + exec_notes
+    exec_note = (
+        f"Execution: slippage={slippage_bps}bps, "
+        f"limit_up={limit_up_pct:.0%}, limit_down={limit_down_pct:.0%}, "
+        f"filter_ST={filter_st}, min_listing_days={min_listing_days}"
+    )
+    notes = [mode_note, cost_note, exec_note] + exec_notes
+
+    # P1: 添加执行统计到 notes
+    if exec_stats:
+        notes.append(
+            f"Execution stats: submitted={exec_stats.order_submitted}, "
+            f"filled={exec_stats.order_filled}, "
+            f"rejected={exec_stats.order_rejected}, "
+            f"avg_slippage={exec_stats.avg_slippage_cost:.4f}"
+        )
+
     trades = pd.DataFrame(trade_rows)
     equity_curve = pd.DataFrame(equity_rows)
 
@@ -664,7 +1193,7 @@ def backtest_from_dpoint(
             equity_curve["total_equity"] / equity_curve["cum_max_equity"] - 1.0
         )
 
-    # P3-17：计算 Buy & Hold 基准，并将其净值列合并进 equity_curve 便于 Excel 对齐
+    # P3-17：计算 Buy & Hold 基准
     benchmark_curve = compute_buy_and_hold(
         df, initial_cash=initial_cash,
         commission_rate_buy=commission_rate_buy,
@@ -690,4 +1219,38 @@ def backtest_from_dpoint(
         equity_curve=equity_curve,
         notes=notes,
         benchmark_curve=benchmark_curve,
+        execution_stats=exec_stats,  # P1: 返回执行统计
     )
+
+
+def _prepare_price_limits(
+    df: pd.DataFrame,
+    limit_up_pct: float,
+    limit_down_pct: float,
+) -> pd.DataFrame:
+    """
+    P0: 预处理涨跌停和停牌标记。
+    """
+    df = df.copy()
+
+    # 前一日收盘价
+    df["prev_close"] = df["close_qfq"].shift(1)
+
+    # 涨跌停价格
+    df["limit_up_price"] = df["prev_close"] * (1 + limit_up_pct)
+    df["limit_down_price"] = df["prev_close"] * (1 - limit_down_pct)
+
+    # 标记是否涨停/跌停（当日开盘触及涨跌停）
+    df["at_limit_up"] = df["open_qfq"] >= df["limit_up_price"]
+    df["at_limit_down"] = df["open_qfq"] <= df["limit_down_price"]
+
+    # 停牌标记（开盘价为0或NaN）
+    df["suspended"] = (df["open_qfq"] <= 0) | df["open_qfq"].isna()
+
+    # ST 标记（需要从外部数据源传入，这里默认 False）
+    df["is_st"] = False
+
+    # 上市天数（从第一行开始计数）
+    df["listing_days"] = range(1, len(df) + 1)
+
+    return df

@@ -11,3 +11,11 @@ __pycache__/
 # Ignore generated outputs
 output/*
 !output/.gitkeep
+
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+~$*
+*.tmp
+output/
