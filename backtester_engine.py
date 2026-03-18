@@ -531,8 +531,6 @@ def calculate_position_size(
     # 取 100 股整数倍
     return (max_shares // 100) * 100
 
-    return apply_slippage(price, action, slippage_bps)
-
 
 # =========================================================
 # 私有工具函数

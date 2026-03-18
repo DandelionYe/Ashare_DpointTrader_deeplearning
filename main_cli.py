@@ -46,7 +46,7 @@ import json
 import os
 import sys
 import subprocess
-from typing import Dict, Optional, List, Any
+from typing import Dict, Optional, List, Any, Tuple
 
 # =========================================================
 # P2-4：conda 激活块 — 防无限递归版
