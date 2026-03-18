@@ -5,9 +5,9 @@
     <img src="https://img.shields.io/badge/文档 - 中文版-red?style=for-the-badge&logo=github" alt="中文文档"/>
   </a>
   &nbsp;
-  <img src="https://img.shields.io/badge/Python-3.9%2B-blue?style=for-the-badge&logo=python"/>
+  <img src="https://img.shields.io/badge/Python-3.11%2B-blue?style=for-the-badge&logo=python"/>
   &nbsp;
-  <img src="https://img.shields.io/badge/PyTorch-supported-ee4c2c?style=for-the-badge&logo=pytorch"/>
+  <img src="https://img.shields.io/badge/PyTorch-2.10.0-ee4c2c?style=for-the-badge&logo=pytorch"/>
   &nbsp;
   <img src="https://img.shields.io/badge/Market-A--Share-gold?style=for-the-badge"/>
 </p>
@@ -19,6 +19,8 @@
 A machine-learning pipeline that generates next-day directional signals (**Dpoint**) for Chinese A-share stocks. The system searches for the best combination of feature engineering, model architecture, and trading parameters through walk-forward cross-validation, then outputs a full backtest report with an Excel workbook.
 
 > ⚠️ **Disclaimer** — This project is for research and educational purposes only. Past backtest results, especially in-sample ones, do **not** guarantee future performance. Nothing here constitutes financial advice.
+
+> 📝 **Changelog** — For detailed version history and changes, see [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -152,12 +154,13 @@ The backtester in `evaluation.py` faithfully models A-share market constraints:
 ├── feature_dpoint.py       Feature engineering (all groups + TA indicators)
 ├── models.py               Model factory (sklearn + PyTorch unified)
 │
-├── training.py             Random search: explore / exploit / pool-exploit rounds
-├── evaluation.py           Backtest engine + risk metrics + regime analysis
+├── training.py             Merged module: random search + calibration + explainer + persistence
+├── evaluation.py           Merged module: backtest engine + risk metrics + regime analysis
 ├── reporting.py            Excel workbook + JSON + HTML report
 ├── rolling_trainer.py      Rolling retrain scheduler (expanding/rolling window)
 ├── utils.py                Reproducibility tools + experiment manifest
 ├── constants.py            Global constants (penalty weights, filenames)
+├── compare_runs.py         Compare multiple runs
 │
 ├── tests/                  Automated test suite
 │   ├── test_no_leakage.py    Temporal leakage tests
@@ -170,7 +173,18 @@ The backtester in `evaluation.py` faithfully models A-share market constraints:
 │   ├── test_reproducibility.py  Reproducibility tests
 │   ├── test_rejection.py    Order rejection logic tests
 │   └── conftest.py          Test fixtures
+│
+├── .github/workflows/
+│   └── ci.yml              GitHub Actions CI (pytest, flake8, black, isort, mypy)
+│
+├── requirements.txt        Python dependencies
+├── pytest.ini              Pytest configuration
+└── README.md               This file
 ```
+
+**Merged Modules (Ver3.0):**
+- `training.py` = calibration.py + explainer.py + persistence.py + search_engine.py + trainer_optimizer.py
+- `evaluation.py` = backtester_engine.py + metrics.py + regime.py
 
 ---
 
@@ -179,16 +193,20 @@ The backtester in `evaluation.py` faithfully models A-share market constraints:
 ### 1. Create the conda environment
 
 ```bash
-conda create -n ashare_dpoint python=3.10
+conda create -n ashare_dpoint python=3.11
 conda activate ashare_dpoint
 ```
 
 ### 2. Install dependencies
 
 ```bash
-pip install pandas numpy scikit-learn joblib openpyxl xlsxwriter torch
-# Optional: for XGBoost support
-pip install xgboost
+pip install -r requirements.txt
+```
+
+Or install manually:
+
+```bash
+pip install pandas numpy scikit-learn joblib openpyxl xlsxwriter torch xgboost tabulate
 ```
 
 > GPU acceleration is detected automatically. If a CUDA-capable GPU is present, PyTorch models and XGBoost will use it.
@@ -386,6 +404,7 @@ The system automatically detects CUDA availability and adjusts `n_jobs` accordin
 - **Stamp duty rate** — The default sell-side cost uses 0.10% stamp duty (pre-2023 rate). Pass `commission_rate_sell=0.0008` to use the post-August-2023 rate of 0.05%.
 - **Cross-ticker generalization** — The `--eval_tickers` flag uses hyperparameter transfer (same config, retrain from scratch on new ticker). It does **not** transfer model weights.
 - **Deep learning model randomness** — MLP/LSTM/GRU/CNN/Transformer models contain stochastic initialization; results may vary slightly between runs even with the same seed due to CUDA non-determinism.
+- **CI/CD Testing** — The project includes automated tests via GitHub Actions (pytest, flake8, black, isort, mypy). Tests run on Python 3.11 and 3.12 only.
 
 ---
 
