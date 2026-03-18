@@ -1,0 +1,23 @@
+# Python cache
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Office temp files
+~$*
+*.tmp
+
+# Ignore generated outputs
+output/*
+!output/.gitkeep
+
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+~$*
+*.tmp
+output/
+.ipynb_checkpoints/
+.pytest_cache/
