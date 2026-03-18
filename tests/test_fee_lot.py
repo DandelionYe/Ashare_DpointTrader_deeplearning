@@ -104,7 +104,7 @@ class TestCommissionRates:
         """Test that sell commission is deducted from proceeds."""
         df = self._prepare_df(minimal_price_data)
         dpoint = pd.Series(0.9, index=df.index)
-        
+
         result = backtest_from_dpoint(
             df,
             dpoint,
@@ -113,28 +113,24 @@ class TestCommissionRates:
             confirm_days=2,
             initial_cash=100000.0,
         )
-        
-        try:
-            if len(result.trades) > 0 and "status" in result.trades.columns:
-                closed_trades = result.trades[result.trades["status"] == "CLOSED"]
-                if len(closed_trades) > 0:
-                    trade = closed_trades.iloc[0]
-                    sell_price = trade["sell_price"]
-                    sell_shares = trade["sell_shares"]
-                    gross_proceeds = sell_shares * sell_price
-                    actual_proceeds = trade["sell_proceeds"]
-                    
-                    commission_rate = 1 - actual_proceeds / gross_proceeds
-                    assert abs(commission_rate - COMMISSION_RATE_SELL) < 0.0001
-        except Exception:
-            pass
-        assert True
+
+        if len(result.trades) > 0 and "status" in result.trades.columns:
+            closed_trades = result.trades[result.trades["status"] == "CLOSED"]
+            if len(closed_trades) > 0:
+                trade = closed_trades.iloc[0]
+                sell_price = trade["sell_price"]
+                sell_shares = trade["sell_shares"]
+                gross_proceeds = sell_shares * sell_price
+                actual_proceeds = trade["sell_proceeds"]
+
+                commission_rate = 1 - actual_proceeds / gross_proceeds
+                assert abs(commission_rate - COMMISSION_RATE_SELL) < 0.0001
     
     def test_pnl_calculation(self, minimal_price_data):
         """Test that PnL is calculated correctly."""
         df = self._prepare_df(minimal_price_data)
         dpoint = pd.Series(0.9, index=df.index)
-        
+
         result = backtest_from_dpoint(
             df,
             dpoint,
@@ -143,25 +139,21 @@ class TestCommissionRates:
             confirm_days=2,
             initial_cash=100000.0,
         )
-        
-        try:
-            if len(result.trades) > 0 and "status" in result.trades.columns:
-                closed_trades = result.trades[result.trades["status"] == "CLOSED"]
-                if len(closed_trades) > 0:
-                    trade = closed_trades.iloc[0]
-                    expected_pnl = trade["sell_proceeds"] - trade["buy_cost"]
-                    actual_pnl = trade["pnl"]
-                    
-                    assert abs(actual_pnl - expected_pnl) < 0.01
-        except Exception:
-            pass
-        assert True
+
+        if len(result.trades) > 0 and "status" in result.trades.columns:
+            closed_trades = result.trades[result.trades["status"] == "CLOSED"]
+            if len(closed_trades) > 0:
+                trade = closed_trades.iloc[0]
+                expected_pnl = trade["sell_proceeds"] - trade["buy_cost"]
+                actual_pnl = trade["pnl"]
+
+                assert abs(actual_pnl - expected_pnl) < 0.01
     
     def test_return_calculation(self, minimal_price_data):
         """Test that return percentage is calculated correctly."""
         df = self._prepare_df(minimal_price_data)
         dpoint = pd.Series(0.9, index=df.index)
-        
+
         result = backtest_from_dpoint(
             df,
             dpoint,
@@ -170,19 +162,15 @@ class TestCommissionRates:
             confirm_days=2,
             initial_cash=100000.0,
         )
-        
-        try:
-            if len(result.trades) > 0 and "status" in result.trades.columns:
-                closed_trades = result.trades[result.trades["status"] == "CLOSED"]
-                if len(closed_trades) > 0:
-                    trade = closed_trades.iloc[0]
-                    expected_return = trade["pnl"] / trade["buy_cost"]
-                    actual_return = trade["return"]
-                    
-                    assert abs(actual_return - expected_return) < 0.0001
-        except Exception:
-            pass
-        assert True
+
+        if len(result.trades) > 0 and "status" in result.trades.columns:
+            closed_trades = result.trades[result.trades["status"] == "CLOSED"]
+            if len(closed_trades) > 0:
+                trade = closed_trades.iloc[0]
+                expected_return = trade["pnl"] / trade["buy_cost"]
+                actual_return = trade["return"]
+
+                assert abs(actual_return - expected_return) < 0.0001
 
 
 class TestConstants:
@@ -217,7 +205,7 @@ class TestTradeCalculations:
         """Test that PnL is calculated correctly."""
         df = self._prepare_df(minimal_price_data)
         dpoint = pd.Series(0.9, index=df.index)
-        
+
         result = backtest_from_dpoint(
             df,
             dpoint,
@@ -226,24 +214,20 @@ class TestTradeCalculations:
             confirm_days=2,
             initial_cash=100000.0,
         )
-        
-        try:
-            if len(result.trades) > 0 and "status" in result.trades.columns:
-                closed_trades = result.trades[result.trades["status"] == "CLOSED"]
-                if len(closed_trades) > 0:
-                    trade = closed_trades.iloc[0]
-                    expected_pnl = trade["sell_proceeds"] - trade["buy_cost"]
-                    actual_pnl = trade["pnl"]
-                    assert abs(actual_pnl - expected_pnl) < 0.01
-        except Exception:
-            pass
-        assert True
-    
+
+        if len(result.trades) > 0 and "status" in result.trades.columns:
+            closed_trades = result.trades[result.trades["status"] == "CLOSED"]
+            if len(closed_trades) > 0:
+                trade = closed_trades.iloc[0]
+                expected_pnl = trade["sell_proceeds"] - trade["buy_cost"]
+                actual_pnl = trade["pnl"]
+                assert abs(actual_pnl - expected_pnl) < 0.01
+
     def test_return_calculation(self, minimal_price_data):
         """Test that return percentage is calculated correctly."""
         df = self._prepare_df(minimal_price_data)
         dpoint = pd.Series(0.9, index=df.index)
-        
+
         result = backtest_from_dpoint(
             df,
             dpoint,
@@ -252,18 +236,14 @@ class TestTradeCalculations:
             confirm_days=2,
             initial_cash=100000.0,
         )
-        
-        try:
-            if len(result.trades) > 0 and "status" in result.trades.columns:
-                closed_trades = result.trades[result.trades["status"] == "CLOSED"]
-                if len(closed_trades) > 0:
-                    trade = closed_trades.iloc[0]
-                    expected_return = trade["pnl"] / trade["buy_cost"]
-                    actual_return = trade["return"]
-                    assert abs(actual_return - expected_return) < 0.0001
-        except Exception:
-            pass
-        assert True
+
+        if len(result.trades) > 0 and "status" in result.trades.columns:
+            closed_trades = result.trades[result.trades["status"] == "CLOSED"]
+            if len(closed_trades) > 0:
+                trade = closed_trades.iloc[0]
+                expected_return = trade["pnl"] / trade["buy_cost"]
+                actual_return = trade["return"]
+                assert abs(actual_return - expected_return) < 0.0001
 
 
 class TestCashManagement:
