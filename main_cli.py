@@ -60,6 +60,10 @@ def _ensure_conda_restart_if_needed():
     P2-4: 检查并执行 conda 环境重启。
     仅在命令行直接执行时调用，避免 import 时自动触发。
     """
+    # 在 CI 环境中跳过 conda 重启
+    if os.environ.get("CI", "").lower() == "true":
+        return
+
     _already_relaunched = os.environ.get("_ASHARE_RELAUNCHED") == "1"
     _skip_conda = os.environ.get("SKIP_CONDA") == "1"
 
