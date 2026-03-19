@@ -272,6 +272,8 @@ class TestEvalOnHoldoutCalibration:
         candidate = self._create_base_candidate()
 
         # 记录 calibrator.fit() 的调用参数
+        # 在 patch 前保存原始方法
+        original_fit = ProbabilityCalibrator.fit
         fit_calls = []
 
         def mock_fit(self, y_true, y_prob):
@@ -280,9 +282,9 @@ class TestEvalOnHoldoutCalibration:
                 "y_prob_len": len(y_prob),
             })
             # 调用原始 fit 方法
-            return ProbabilityCalibrator.fit.__wrapped__(self, y_true, y_prob)
+            return original_fit(self, y_true, y_prob)
 
-        with patch.object(ProbabilityCalibrator, 'fit', new=mock_fit):
+        with patch.object(ProbabilityCalibrator, "fit", new=mock_fit):
             with patch('trainer.backtest_fold_stats') as mock_backtest:
                 mock_backtest.return_value = {
                     "equity_end": 110000.0,

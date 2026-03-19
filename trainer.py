@@ -264,35 +264,6 @@ def _calibrate_predictions(
             "calibration_failed": True,
         }
 
-
-def _aggregate_holdout_calibration_metrics(
-    fold_metrics: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """
-    聚合多折 holdout 校准指标。
-
-    Args:
-        fold_metrics: 每折的校准指标列表
-
-    Returns:
-        平均后的汇总指标字典
-    """
-    if not fold_metrics:
-        return {}
-    
-    valid_metrics = [m for m in fold_metrics if m is not None]
-    if not valid_metrics:
-        return {}
-    
-    # 计算平均值
-    avg_metrics = {
-        "brier_score": float(np.mean([m.get("brier_score", 0) for m in valid_metrics])),
-        "ece": float(np.mean([m.get("ece", 0) for m in valid_metrics])),
-        "mce": float(np.mean([m.get("mce", 0) for m in valid_metrics])),
-    }
-    
-    return avg_metrics
-
 # SHAP 和 Permutation Importance 可选导入
 try:
     import shap
