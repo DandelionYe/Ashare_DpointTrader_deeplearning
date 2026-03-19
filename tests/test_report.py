@@ -17,6 +17,22 @@ from reporter import (
 from backtester import calculate_risk_metrics
 
 
+class _DFPrepMixin:
+    """Shared mixin for tests that need _prepare_df helper."""
+    def _prepare_df(self, df):
+        """Prepare dataframe with proper date column."""
+        df = df.copy()
+        if df.index.name == "date":
+            df = df.reset_index()
+        if "date" not in df.columns:
+            df = df.reset_index()
+            if "index" in df.columns:
+                df = df.rename(columns={"index": "date"})
+        if "date" in df.columns and not pd.api.types.is_datetime64_any_dtype(df["date"]):
+            df["date"] = pd.to_datetime(df["date"])
+        return df
+
+
 class TestReportGeneration:
     """Test report generation functionality."""
 
@@ -220,7 +236,7 @@ class TestRiskMetricsInReport:
 # Phase 3: 新增回归测试 - Holdout 和 config JSON
 # =========================================================
 
-class TestHoldoutMetricHandling:
+class TestHoldoutMetricHandling(_DFPrepMixin):
     """Test holdout metric handling in report generation."""
 
     def test_save_run_outputs_with_holdout_in_config_json(self, minimal_price_data, temp_output_dir):
@@ -366,7 +382,7 @@ class TestHoldoutMetricHandling:
             "holdout_equity should be None when not provided"
 
 
-class TestSplitModeInConfig:
+class TestSplitModeInConfig(_DFPrepMixin):
     """Test split_mode is correctly written to config."""
 
     def test_split_mode_walkforward(self, minimal_price_data, temp_output_dir):

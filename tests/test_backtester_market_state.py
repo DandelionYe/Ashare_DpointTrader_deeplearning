@@ -135,7 +135,7 @@ class TestLayeredSlippage:
             "is_st": [False] * 10,
             "listing_days": [100] * 10,
             "prev_close": [10.0] * 10,
-        }).set_index("date")
+        })
         
         # 记录 apply_layered_slippage 的调用参数
         slippage_calls = []

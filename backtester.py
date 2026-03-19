@@ -292,16 +292,24 @@ def check_execution_feasibility(
 
     # 6. 检查流动性
     # P2 修复：默认使用 amount（成交额），仅当显式指定 min_daily_volume 时才使用 volume（成交量）
+    # 如果 amount 缺失，回退到 volume 以保持向后兼容
     if min_daily_volume is not None:
         # legacy 模式：使用 volume
         daily_liquidity = float(row.get("volume", 0) or 0)
         threshold = float(min_daily_volume)
         reject_reason = "成交量过低"
     else:
-        # 默认模式：使用 amount（成交额）
-        daily_liquidity = float(row.get("amount", 0) or 0)
-        threshold = float(min_daily_amount)
-        reject_reason = "成交额过低"
+        # 默认模式：优先使用 amount（成交额），缺失时回退到 volume
+        amount_value = row.get("amount", np.nan)
+        if pd.notna(amount_value):
+            daily_liquidity = float(amount_value or 0)
+            threshold = float(min_daily_amount)
+            reject_reason = "成交额过低"
+        else:
+            # backward compatibility: when amount is absent, fall back to volume
+            daily_liquidity = float(row.get("volume", 0) or 0)
+            threshold = float(DEFAULT_MIN_DAILY_VOLUME)
+            reject_reason = "成交量过低"
 
     if threshold > 0 and daily_liquidity < threshold:
         return False, reject_reason

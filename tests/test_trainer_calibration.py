@@ -35,7 +35,7 @@ class TestEvalCandidateCalibration:
             "volume": 1000000 + np.random.rand(n_samples) * 100000,
             "amount": 10000000 + np.random.rand(n_samples) * 1000000,
             "turnover_rate": 0.01 + np.random.rand(n_samples) * 0.01,
-        }).set_index("date")
+        })
 
     def _create_base_candidate(self, use_for_threshold):
         """创建基础候选配置。"""
@@ -215,7 +215,7 @@ class TestEvalOnHoldoutCalibration:
             "volume": 1000000 + np.random.rand(n_search) * 100000,
             "amount": 10000000 + np.random.rand(n_search) * 1000000,
             "turnover_rate": 0.01 + np.random.rand(n_search) * 0.01,
-        }).set_index("date")
+        })
 
         holdout_df = pd.DataFrame({
             "date": pd.date_range("2023-06-01", periods=n_holdout),
@@ -226,7 +226,7 @@ class TestEvalOnHoldoutCalibration:
             "volume": 1000000 + np.random.rand(n_holdout) * 100000,
             "amount": 10000000 + np.random.rand(n_holdout) * 1000000,
             "turnover_rate": 0.01 + np.random.rand(n_holdout) * 0.01,
-        }).set_index("date")
+        })
 
         return search_df, holdout_df
 
