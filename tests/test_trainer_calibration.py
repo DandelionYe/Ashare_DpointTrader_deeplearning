@@ -52,8 +52,10 @@ class TestEvalCandidateCalibration:
             },
             "model_config": {
                 "model_type": "logreg",
+                "solver": "lbfgs",
                 "penalty": "l2",
                 "C": 1.0,
+                "max_iter": 200,
             },
             "trade_config": {
                 "initial_cash": 100000.0,
@@ -245,8 +247,10 @@ class TestEvalOnHoldoutCalibration:
             },
             "model_config": {
                 "model_type": "logreg",
+                "solver": "lbfgs",
                 "penalty": "l2",
                 "C": 1.0,
+                "max_iter": 200,
             },
             "trade_config": {
                 "initial_cash": 100000.0,
