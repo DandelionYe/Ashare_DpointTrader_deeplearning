@@ -1,102 +1,33 @@
-# Changelog
+## [Ver3.5] - 2026-03-21
 
-## [Ver3.0] - 2026-03-19
+### Structural cleanup and module renaming
+- Unified core module names for better clarity and maintainability:
+  - `data.py` → `data_loader.py`
+  - `training.py` → `trainer.py`
+  - `evaluation.py` → `backtester.py`
+  - `reporting.py` → `reporter.py`
+- Updated module references across the main pipeline, tests, and documentation to match the current repository layout.
 
-### 🚀 Major Refactor - Module Naming Unification
+### CLI and conda environment handling
+- Refined conda environment behavior:
+  - the CLI no longer auto-relaunches by default;
+  - relaunch only happens when `--use-conda-env` is explicitly provided;
+  - added `--target-conda-env` for warning and expectation handling.
+- Improved safety and control of environment switching in IDE, CI, and scheduled execution scenarios.
 
-* **Unified module naming across codebase, README, CLI, and tests**
-* Refactored core module names for clarity:
+### Expanded test coverage
+- Added coverage for:
+  - backtester market-state behavior,
+  - conda environment handling,
+  - optional torch runtime,
+  - trainer calibration,
+  - trainer split modes.
+- Strengthened regression coverage across training, backtesting, runtime environment, and compatibility behaviors.
 
-  * `data.py` → `data_loader.py` (Excel loader + walk-forward splits)
-  * `training.py` → `trainer.py` (random search + calibration + persistence)
-  * `evaluation.py` → `backtester.py` (backtest engine + metrics + regime analysis)
-  * `reporting.py` → `reporter.py` (Excel/JSON/HTML reporting)
-* Updated all imports in:
+### Dependencies and CI
+- Added `requirements-dev.txt` to separate development/test dependencies from runtime dependencies.
+- Updated CI to install from `requirements-dev.txt` for more consistent development and automation environments.
 
-  * `main_cli.py`
-  * `dpoint_updater.py`
-  * All test files
-* README Architecture Overview now shows flat module structure
-* Removed all legacy module references from documentation
-
-### 🧪 Test Quality Improvements
-
-* Fixed fake tests using `try: ... except: pass; assert True` pattern
-* All 110 tests now properly assert conditions
-* Smoke tests now reliably catch regressions
-* **Completed: real smoke tests replace false-positive tests**
-* **Completed: end-to-end CLI smoke test added and wired into CI**
-
-### ⚙️ CLI Conda Environment Handling
-
-* **Changed conda relaunch behavior: CLI no longer auto-relaunches by default**
-* Relaunch only occurs when `--use-conda-env <env>` is explicitly provided
-* Added new CLI arguments:
-  * `--use-conda-env <env_name>`: Explicitly relaunch inside the given conda environment
-  * `--target-conda-env <env_name>`: Expected conda environment name for warning messages (default: `ashare_dpoint`)
-* Default mode now only prints a warning if current environment doesn't match
-* Fixed: `relaunch_in_conda` now uses `python` instead of `sys.executable` to ensure correct interpreter in target environment
-* Added 14 unit tests for conda environment switching logic
-* Removed dead code: `--list_experiments` / `-l` flag
-
-### 📦 Previous Changes (Ver3.0 - 2026-03-18)
-
-* Refactored project structure to improve modularity and maintainability
-* Reorganized core modules:
-
-  * `training.py` replaces `trainer_optimizer.py`
-  * `evaluation.py` replaces `backtester_engine.py` and parts of `metrics.py`
-  * `utils.py` consolidates run manifest utilities
-* Removed legacy modules and unified logic into clearer functional boundaries
-
-### 🧠 Core Logic Improvements
-
-* Fixed execution feasibility logic:
-
-  * Correct handling of volume-based liquidity filtering
-  * Proper handling of ST filter toggle and listing days constraint
-* Improved backtesting robustness:
-
-  * Graceful handling of missing columns like `amount`
-  * Better default fallbacks for incomplete datasets
-
-### 📊 Metrics & Evaluation
-
-* Reworked `trade_penalty` logic:
-
-  * Penalty is now zero at target trades
-  * Monotonic increase as deviation grows
-* Improved consistency between evaluation metrics and test expectations
-
-### 🧪 Testing & CI
-
-* Updated all tests to align with new module structure
-* Removed reliance on legacy module names (`trainer_optimizer`, `backtester_engine`, `run_manifest`)
-* Fixed CI issues:
-
-  * Removed invalid dependencies (e.g. `types-pandas`)
-  * Fixed Python version compatibility
-  * Prevented `conda` restart in CI environment
-
-### ⚙️ CLI Improvements
-
-* Fixed import-side effects in `main_cli.py`
-* Ensured CLI logic only executes under `__main__`
-* Improved compatibility with CI and testing environments
-
-### 🧹 Cleanup
-
-* Removed deprecated files:
-
-  * `trainer_optimizer.py`
-  * `backtester_engine.py`
-  * `run_manifest.py`
-* Simplified project structure and reduced duplication
-
----
-
-## [Ver2.0] - Previous Release
-
-* Initial structured version of the backtesting and training pipeline
-* Introduced CI, testing framework, and modular components
-* Included early implementations of execution constraints and evaluation metrics
+### Documentation
+- Updated both README files to reflect the current repository structure, module naming, and test layout.
+- Cleaned up version notes to make future tag-based release tracking clearer.
