@@ -15,6 +15,7 @@ from unittest.mock import patch
 from trainer import (
     _eval_candidate,
     _eval_on_holdout,
+    _build_holdout_features_with_context,
     build_features_and_labels,
     ProbabilityCalibrator,
 )
@@ -135,7 +136,102 @@ class TestEvalCandidateCalibration:
         assert "calibration_summary" in info
         cal_summary = info["calibration_summary"]
         assert cal_summary.get("calibration_method") == "platt"
-        assert "brier_score_raw" in cal_summary or len(cal_summary) == 1  # 至少有 method 或有指标
+
+    def test_eval_candidate_aligns_sequence_calibration_labels(self):
+        """
+        序列模型预测长度比 y_val 短时，应按索引对齐后继续校准，而不是静默跳过。
+        """
+        df_clean = self._create_test_data(n_samples=180)
+        candidate = {
+            "feature_config": {
+                "windows": [5, 10],
+                "use_momentum": True,
+                "use_volatility": False,
+                "use_volume": False,
+                "use_candle": False,
+                "use_turnover": False,
+                "vol_metric": "std",
+                "liq_transform": "ratio",
+            },
+            "model_config": {
+                "model_type": "lstm",
+                "hidden_dim": 8,
+                "num_layers": 1,
+                "dropout_rate": 0.1,
+                "epochs": 1,
+                "batch_size": 8,
+                "seq_len": 5,
+            },
+            "trade_config": {
+                "initial_cash": 100000.0,
+                "buy_threshold": 0.55,
+                "sell_threshold": 0.45,
+                "confirm_days": 1,
+                "min_hold_days": 1,
+                "max_hold_days": 20,
+            },
+            "calibration_config": {
+                "method": "platt",
+                "use_for_threshold": True,
+            },
+            "candidate_seed": 42,
+        }
+
+        fit_lengths = []
+
+        def mock_train_pytorch_model(X_train, y_train, config, device, X_val=None, y_val=None):
+            return object()
+
+        def mock_predict_pytorch_model(model, X_target, device, seq_len=20):
+            valid_index = X_target.index[seq_len - 1:]
+            return pd.Series(
+                np.linspace(0.2, 0.8, len(valid_index)),
+                index=valid_index,
+                name="dpoint",
+            )
+
+        def mock_fit(self, y_true, y_prob):
+            fit_lengths.append((len(y_true), len(y_prob)))
+            self._is_fitted = True
+            return self
+
+        def mock_transform(self, y_prob):
+            arr = np.asarray(y_prob, dtype=float)
+            return np.clip(arr + 0.05, 0.0, 1.0)
+
+        def mock_backtest_fold_stats(df_full, X_val, dpoint_val, trade_cfg):
+            return {
+                "equity_end": 110000.0,
+                "n_closed": 5,
+                "n_total": 5,
+            }
+
+        with patch("trainer.train_pytorch_model", side_effect=mock_train_pytorch_model):
+            with patch("trainer.predict_pytorch_model", side_effect=mock_predict_pytorch_model):
+                with patch.object(ProbabilityCalibrator, "fit", new=mock_fit):
+                    with patch.object(ProbabilityCalibrator, "transform", new=mock_transform):
+                        with patch("trainer.backtest_fold_stats", side_effect=mock_backtest_fold_stats):
+                            X, y, meta = build_features_and_labels(df_clean, candidate["feature_config"])
+                            split_point = len(X) // 2
+                            metric, equity, info, fold_details = _eval_candidate(
+                                candidate, df_clean, max_features=100, n_folds=1,
+                                train_start_ratio=0.5, wf_min_rows=20,
+                                computed_feats=(
+                                    X,
+                                    y,
+                                    meta,
+                                ),
+                                use_embargo=False, embargo_days=0, use_nested_wf=False,
+                            )
+
+        assert fit_lengths, "Sequence-model calibration should fit after index alignment"
+        aligned_y_len, aligned_pred_len = fit_lengths[0]
+        assert aligned_y_len == aligned_pred_len
+        assert aligned_y_len == len(y.iloc[split_point + candidate["model_config"]["seq_len"] - 1 :])
+        assert "calibration_summary" in info
+        cal_summary = info["calibration_summary"]
+        assert cal_summary.get("calibration_method") == "platt"
+        assert "brier_score_raw" in cal_summary or len(cal_summary) == 1
 
     def test_eval_candidate_respects_use_for_threshold_true(self):
         """
@@ -266,6 +362,36 @@ class TestEvalOnHoldoutCalibration:
             },
             "candidate_seed": 42,
         }
+
+    def test_holdout_features_keep_search_context(self):
+        """
+        holdout 特征应继承 search 尾部历史，避免边界 warmup 损失。
+        """
+        search_df, holdout_df = self._create_test_data(n_search=80, n_holdout=20)
+        feature_config = {
+            "windows": [5, 10],
+            "use_momentum": True,
+            "use_volatility": False,
+            "use_volume": False,
+            "use_candle": False,
+            "use_turnover": False,
+            "vol_metric": "std",
+            "liq_transform": "ratio",
+        }
+
+        X_holdout_ctx, y_holdout_ctx = _build_holdout_features_with_context(
+            search_df, holdout_df, feature_config
+        )
+        X_holdout_standalone, y_holdout_standalone, _ = build_features_and_labels(
+            holdout_df, feature_config
+        )
+
+        first_holdout_date = pd.to_datetime(holdout_df["date"].iloc[0])
+
+        assert not X_holdout_ctx.empty
+        assert X_holdout_ctx.index.min() == first_holdout_date
+        assert len(X_holdout_ctx) > len(X_holdout_standalone)
+        assert len(y_holdout_ctx) == len(X_holdout_ctx)
 
     def test_holdout_calibration_uses_validation_prediction_length(self):
         """

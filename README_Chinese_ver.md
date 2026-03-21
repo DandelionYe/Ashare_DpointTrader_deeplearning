@@ -169,10 +169,8 @@ compare_runs.py     对比历史运行结果
 │   ├── test_rejection.py    订单拒绝逻辑测试
 │   └── conftest.py         测试 fixtures
 │
-├── .github/workflows/
-│   └── ci.yml              GitHub Actions CI (pytest, flake8, black, isort, mypy)
-│
 ├── requirements.txt        Python 依赖
+├── requirements-dev.txt    开发与测试依赖
 ├── pytest.ini              Pytest 配置
 └── README_Chinese_ver.md   本文件
 ```
@@ -202,6 +200,12 @@ pip install -r requirements.txt
 
 ```bash
 pip install pandas numpy scikit-learn joblib openpyxl xlsxwriter torch xgboost tabulate
+```
+
+如需运行测试：
+
+```bash
+pip install -r requirements-dev.txt
 ```
 
 > GPU 加速自动检测。若系统存在 CUDA 可用的 GPU，PyTorch 模型和 XGBoost 将自动启用 GPU 加速。
@@ -390,11 +394,14 @@ python dpoint_updater.py --output_dir ./output
 
 ### 多重防过拟合机制
 - **Final Holdout Split**: 留出 15% 数据作为最终测试集，搜索过程完全不接触
-- **Nested Walk-Forward**: 内层 CV 用于模型选择，外层 CV 用于性能评估
 - **Embargo Gap**: 训练集和验证集之间留出 5 天间隔，防止滚动窗口特征泄露
 - **参数敏感性分析**: 检查最优解是否过于"尖锐"
 - **多种子稳定性评估**: Top-N 候选使用多个随机种子重新评估
 - **惩罚项**: 最差折惩罚、折方差惩罚、交易次数过少惩罚
+
+> **关于 Nested Walk-Forward 的说明**：`data_loader.py` 中的 `nested_walkforward_splits()` 已作为独立切分工具保留并测试，但**尚未接入生产搜索主循环**。当前生产可用的切分模式只有：
+> - `walkforward`：标准 Walk-Forward 交叉验证
+> - `walkforward_embargo`：带 embargo gap 的 Walk-Forward
 
 ### 交易次数惩罚项
 软惩罚项抑制每折交易次数偏离目标值（`TARGET_CLOSED_TRADES_PER_FOLD`）的配置，防止优化器收敛到退化解（如从不交易或每日交易）。

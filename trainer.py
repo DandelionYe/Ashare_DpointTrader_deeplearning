@@ -208,7 +208,14 @@ def _calibrate_predictions(
     method = str(calibration_config.get("method", "none"))
     use_for_threshold = bool(calibration_config.get("use_for_threshold", False))
 
-    if method == "none" or len(y_calib) < 20 or len(y_calib) != len(pred_calib_raw):
+    y_calib_aligned = y_calib.reindex(pred_calib_raw.index).dropna()
+    pred_calib_aligned = pred_calib_raw.reindex(y_calib_aligned.index)
+
+    if (
+        method == "none"
+        or len(y_calib_aligned) < 20
+        or len(y_calib_aligned) != len(pred_calib_aligned)
+    ):
         return {
             "pred_target_raw": pred_target_raw,
             "pred_target_calibrated": pred_target_raw,
@@ -219,7 +226,7 @@ def _calibrate_predictions(
 
     try:
         calibrator = ProbabilityCalibrator(method=method)
-        calibrator.fit(y_calib.values, pred_calib_raw.values)
+        calibrator.fit(y_calib_aligned.values, pred_calib_aligned.values)
 
         pred_target_calibrated = pd.Series(
             calibrator.transform(pred_target_raw.values),
@@ -232,11 +239,11 @@ def _calibrate_predictions(
 
         # 计算校准指标 - 在 calibration 集上计算 raw 和 calibrated 指标
         raw_metrics = compute_all_calibration_metrics(
-            y_calib.values, pred_calib_raw.values, n_bins=10
+            y_calib_aligned.values, pred_calib_aligned.values, n_bins=10
         )
-        calib_on_calib = calibrator.transform(pred_calib_raw.values)
+        calib_on_calib = calibrator.transform(pred_calib_aligned.values)
         cal_metrics = compute_all_calibration_metrics(
-            y_calib.values, calib_on_calib, n_bins=10
+            y_calib_aligned.values, calib_on_calib, n_bins=10
         )
 
         return {
@@ -263,6 +270,30 @@ def _calibrate_predictions(
             "calibration_metrics": None,
             "calibration_failed": True,
         }
+
+
+def _build_holdout_features_with_context(
+    search_df: pd.DataFrame,
+    holdout_df: pd.DataFrame,
+    feature_config: Dict[str, Any],
+) -> Tuple[pd.DataFrame, pd.Series]:
+    """
+    为 holdout 构建带历史上下文的特征。
+
+    holdout 期的 rolling / EMA / 序列窗口特征必须看到 search 期尾部历史，
+    否则会在 search/holdout 边界丢失上下文，导致序列模型和技术指标在
+    holdout 初期出现额外 warmup 损失。
+    """
+    combined_df = (
+        pd.concat([search_df, holdout_df], axis=0, ignore_index=True)
+        .sort_values("date")
+        .drop_duplicates(subset=["date"], keep="last")
+        .reset_index(drop=True)
+    )
+    X_full, y_full, _ = build_features_and_labels(combined_df, feature_config)
+    holdout_dates = pd.to_datetime(holdout_df["date"])
+    holdout_mask = X_full.index.isin(holdout_dates)
+    return X_full.loc[holdout_mask].copy(), y_full.loc[holdout_mask].copy()
 
 # SHAP 和 Permutation Importance 可选导入
 try:
@@ -1746,11 +1777,11 @@ def _eval_on_holdout(
 
     X_search, y_search, meta = computed_feats
 
-    holdout_computed = build_features_and_labels(holdout_df, candidate["feature_config"])
-    if holdout_computed is None:
+    X_holdout, y_holdout = _build_holdout_features_with_context(
+        search_df, holdout_df, candidate["feature_config"]
+    )
+    if X_holdout.empty or y_holdout.empty:
         return (-np.inf, 100000.0, {"skip": "holdout_feat_fail"}, [])
-
-    X_holdout, y_holdout, _ = holdout_computed
 
     if len(X_search.columns) > max_features:
         return (-np.inf, float(candidate["trade_config"]["initial_cash"]), {"skip": "too_many_feats", "n_features": len(X_search.columns)}, [])

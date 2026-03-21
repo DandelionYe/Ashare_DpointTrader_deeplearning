@@ -163,3 +163,10 @@ class TestNestedWalkforward:
         assert len(splits) > 0
         for outer_train, outer_val, inner_splits in splits:
             assert len(inner_splits) > 0
+            prev_inner_train_len = 0
+            for (X_inner_train, _), (X_inner_val, _) in inner_splits:
+                assert len(X_inner_train) >= prev_inner_train_len
+                assert len(X_inner_train) > 0
+                assert len(X_inner_val) > 0
+                assert X_inner_train.index.max() < X_inner_val.index.min()
+                prev_inner_train_len = len(X_inner_train)

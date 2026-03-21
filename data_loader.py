@@ -448,7 +448,8 @@ def nested_walkforward_splits(
 
     与普通 walk-forward 的区别：
         - 外层：标准的 walk-forward split（训练集扩展到当前点，验证集下一段）
-        - 内层：在外层训练集上再做一次 walk-forward，用于模型选择/超参调优
+        - 内层：在外层训练集上再做一次 expanding-window walk-forward，
+          用于模型选择/超参调优
         - 这样可以避免"用验证集选择模型，再用同一验证集评估模型"的前向偏差
 
     另外增加了 embargo_days：
@@ -509,25 +510,15 @@ def nested_walkforward_splits(
                           k + 1, len(X_outer_train), len(X_outer_val))
             continue
 
-        # 内层 walk-forward：在外层训练集上做
-        inner_cuts = [
-            1.0 * i / n_inner_folds
-            for i in range(n_inner_folds + 1)
-        ]
-        inner_splits = []
-        for j in range(len(inner_cuts) - 1):
-            inner_train_end = int(len(X_outer_train) * inner_cuts[j])
-            inner_val_end = int(len(X_outer_train) * inner_cuts[j + 1])
-
-            if inner_train_end < min_rows or (inner_val_end - inner_train_end) < min_rows:
-                continue
-
-            X_inner_train = X_outer_train.iloc[:inner_train_end]
-            y_inner_train = y_outer_train.iloc[:inner_train_end]
-            X_inner_val = X_outer_train.iloc[inner_train_end:inner_val_end]
-            y_inner_val = y_outer_train.iloc[inner_train_end:inner_val_end]
-
-            inner_splits.append(((X_inner_train, y_inner_train), (X_inner_val, y_inner_val)))
+        # 内层 walk-forward：在外层训练集上复用标准 expanding-window 切分，
+        # 避免首折训练集为空或折数语义与公开参数不一致。
+        inner_splits = walkforward_splits(
+            X_outer_train,
+            y_outer_train,
+            n_folds=n_inner_folds,
+            train_start_ratio=train_start_ratio,
+            min_rows=min_rows,
+        )
 
         if not inner_splits:
             logger.warning("nested_walkforward: fold %d skipped (no valid inner splits)", k + 1)

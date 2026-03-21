@@ -169,10 +169,8 @@ The backtester in `backtester.py` faithfully models A-share market constraints:
 │   ├── test_rejection.py    Order rejection logic tests
 │   └── conftest.py          Test fixtures
 │
-├── .github/workflows/
-│   └── ci.yml              GitHub Actions CI (pytest, flake8, black, isort, mypy)
-│
 ├── requirements.txt        Python dependencies
+├── requirements-dev.txt    Development + test dependencies
 ├── pytest.ini              Pytest configuration
 └── README.md               This file
 ```
@@ -202,6 +200,12 @@ Or install manually:
 
 ```bash
 pip install pandas numpy scikit-learn joblib openpyxl xlsxwriter torch xgboost tabulate
+```
+
+For development and tests:
+
+```bash
+pip install -r requirements-dev.txt
 ```
 
 > GPU acceleration is detected automatically. If a CUDA-capable GPU is present, PyTorch models and XGBoost will use it.
@@ -408,7 +412,7 @@ The optimizer evaluates each candidate using non-overlapping out-of-sample valid
 - **Multi-seed Stability**: Top-N candidates re-evaluated with multiple seeds to assess robustness
 - **Penalty Terms**: Worst-fold penalty, fold-variance penalty, too-few-trades penalty
 
-> **Note on Nested Walk-Forward**: The `nested_walkforward_splits()` utility exists in `data_loader.py`, but it is **not integrated into the production search loop yet**. Current production split modes are:
+> **Note on Nested Walk-Forward**: The `nested_walkforward_splits()` utility in `data_loader.py` is tested as a standalone splitter, but it is still **not integrated into the production search loop**. Current production split modes are:
 > - `walkforward` — standard walk-forward cross-validation
 > - `walkforward_embargo` — walk-forward with embargo gap
 > 
