@@ -18,14 +18,29 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.amp import GradScaler, autocast
-from torch.utils.data import DataLoader, TensorDataset
 from sklearn.linear_model import LogisticRegression, SGDClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
+TORCH_AVAILABLE = False
+TORCH_IMPORT_ERROR: Optional[Exception] = None
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.amp import GradScaler, autocast
+    from torch.utils.data import DataLoader, TensorDataset
+    TORCH_AVAILABLE = True
+except Exception as exc:  # pragma: no cover - exercised indirectly via import tests
+    torch = None  # type: ignore[assignment]
+    nn = None  # type: ignore[assignment]
+    optim = None  # type: ignore[assignment]
+    GradScaler = None  # type: ignore[assignment]
+    autocast = None  # type: ignore[assignment]
+    DataLoader = Any  # type: ignore[assignment]
+    TensorDataset = Any  # type: ignore[assignment]
+    TORCH_IMPORT_ERROR = exc
 
 __all__ = [
     # 深度学习模型类
@@ -39,11 +54,35 @@ __all__ = [
 ]
 
 
+class _CpuFallbackDevice:
+    """Torch 不可用时的最小设备占位对象。"""
+
+    type = "cpu"
+
+    def __str__(self) -> str:
+        return self.type
+
+
+def _require_torch(feature: str) -> None:
+    """在真正使用 PyTorch 路径时再抛出清晰错误。"""
+    if TORCH_AVAILABLE:
+        return
+
+    detail = ""
+    if TORCH_IMPORT_ERROR is not None:
+        detail = f" Original import error: {TORCH_IMPORT_ERROR!r}"
+    raise RuntimeError(
+        f"{feature} requires PyTorch, but PyTorch is not installed or failed to import.{detail}"
+    )
+
+
 # =========================================================
 # 设备检测
 # =========================================================
 def _get_device() -> torch.device:
     """自动检测并返回可用的计算设备（CUDA 或 CPU）。"""
+    if not TORCH_AVAILABLE:
+        return _CpuFallbackDevice()  # type: ignore[return-value]
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -55,7 +94,7 @@ def create_sequence_dataset(
     y: Optional[pd.Series] = None,
     seq_len: int = 20,
     batch_size: int = 64,
-    device: torch.device = torch.device("cpu"),
+    device: Optional[torch.device] = None,
     shuffle: bool = True,
 ) -> DataLoader:
     """
@@ -72,6 +111,7 @@ def create_sequence_dataset(
     Returns:
         DataLoader
     """
+    _require_torch("create_sequence_dataset")
     _ = device
 
     X_tensor = torch.tensor(X.values, dtype=torch.float32)
@@ -141,216 +181,245 @@ def _logits_to_probs(logits: torch.Tensor) -> torch.Tensor:
 # =========================================================
 # PyTorch 模型定义
 # =========================================================
-class MLP(nn.Module):
-    """简单的多层感知机，用于二分类任务（输出 raw logits）。"""
+if TORCH_AVAILABLE:
+    class MLP(nn.Module):
+        """简单的多层感知机，用于二分类任务（输出 raw logits）。"""
 
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int = 1, dropout_rate: float = 0.5):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(dropout_rate)
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        def __init__(self, input_dim: int, hidden_dim: int, output_dim: int = 1, dropout_rate: float = 0.5):
+            super().__init__()
+            self.fc1 = nn.Linear(input_dim, hidden_dim)
+            self.relu = nn.ReLU()
+            self.dropout = nn.Dropout(dropout_rate)
+            self.fc2 = nn.Linear(hidden_dim, output_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.fc1(x)
-        x = self.relu(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return x
-
-
-class LSTM(nn.Module):
-    """LSTM（长短期记忆网络）用于时序二分类（输出 raw logits）。"""
-
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int = 64,
-        num_layers: int = 2,
-        output_dim: int = 1,
-        dropout_rate: float = 0.3,
-        bidirectional: bool = False,
-        batch_first: bool = True,
-    ):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
-        self.bidirectional = bidirectional
-        self.batch_first = batch_first
-
-        self.lstm = nn.LSTM(
-            input_size=input_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=batch_first,
-            dropout=dropout_rate if num_layers > 1 else 0.0,
-            bidirectional=bidirectional,
-        )
-
-        self.dropout = nn.Dropout(dropout_rate)
-        lstm_output_dim = hidden_dim * 2 if bidirectional else hidden_dim
-        self.fc = nn.Linear(lstm_output_dim, output_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        _, (h_n, _) = self.lstm(x)
-        if self.bidirectional:
-            last_output = torch.cat((h_n[-2, :, :], h_n[-1, :, :]), dim=1)
-        else:
-            last_output = h_n[-1, :, :]
-        x = self.dropout(last_output)
-        x = self.fc(x)
-        return x
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            x = self.fc1(x)
+            x = self.relu(x)
+            x = self.dropout(x)
+            x = self.fc2(x)
+            return x
 
 
-class GRU(nn.Module):
-    """GRU（门控循环单元）用于时序二分类（输出 raw logits）。"""
+    class LSTM(nn.Module):
+        """LSTM（长短期记忆网络）用于时序二分类（输出 raw logits）。"""
 
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int = 64,
-        num_layers: int = 2,
-        output_dim: int = 1,
-        dropout_rate: float = 0.3,
-        bidirectional: bool = False,
-        batch_first: bool = True,
-    ):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
-        self.bidirectional = bidirectional
+        def __init__(
+            self,
+            input_dim: int,
+            hidden_dim: int = 64,
+            num_layers: int = 2,
+            output_dim: int = 1,
+            dropout_rate: float = 0.3,
+            bidirectional: bool = False,
+            batch_first: bool = True,
+        ):
+            super().__init__()
+            self.hidden_dim = hidden_dim
+            self.num_layers = num_layers
+            self.bidirectional = bidirectional
+            self.batch_first = batch_first
 
-        self.gru = nn.GRU(
-            input_size=input_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=batch_first,
-            dropout=dropout_rate if num_layers > 1 else 0.0,
-            bidirectional=bidirectional,
-        )
+            self.lstm = nn.LSTM(
+                input_size=input_dim,
+                hidden_size=hidden_dim,
+                num_layers=num_layers,
+                batch_first=batch_first,
+                dropout=dropout_rate if num_layers > 1 else 0.0,
+                bidirectional=bidirectional,
+            )
 
-        self.dropout = nn.Dropout(dropout_rate)
-        gru_output_dim = hidden_dim * 2 if bidirectional else hidden_dim
-        self.fc = nn.Linear(gru_output_dim, output_dim)
+            self.dropout = nn.Dropout(dropout_rate)
+            lstm_output_dim = hidden_dim * 2 if bidirectional else hidden_dim
+            self.fc = nn.Linear(lstm_output_dim, output_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        _, h_n = self.gru(x)
-        if self.bidirectional:
-            last_output = torch.cat((h_n[-2, :, :], h_n[-1, :, :]), dim=1)
-        else:
-            last_output = h_n[-1, :, :]
-        x = self.dropout(last_output)
-        x = self.fc(x)
-        return x
-
-
-class CNN1D(nn.Module):
-    """一维卷积神经网络（CNN）用于时序二分类（输出 raw logits）。"""
-
-    def __init__(
-        self,
-        input_dim: int,
-        seq_len: int,
-        num_filters: int = 64,
-        kernel_sizes: Optional[list] = None,
-        output_dim: int = 1,
-        dropout_rate: float = 0.3,
-    ):
-        super().__init__()
-
-        if kernel_sizes is None:
-            kernel_sizes = [2, 3, 5]
-
-        self.convs = nn.ModuleList([
-            nn.Conv1d(in_channels=input_dim, out_channels=num_filters, kernel_size=k, padding=k // 2)
-            for k in kernel_sizes
-        ])
-
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(dropout_rate)
-
-        total_features = num_filters * len(kernel_sizes)
-        self.fc = nn.Linear(total_features, output_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.transpose(1, 2)
-        conv_outputs = []
-        for conv in self.convs:
-            conv_out = self.relu(conv(x))
-            pooled = torch.max(conv_out, dim=2)[0]
-            conv_outputs.append(pooled)
-        x = torch.cat(conv_outputs, dim=1)
-        x = self.dropout(x)
-        x = self.fc(x)
-        return x
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            _, (h_n, _) = self.lstm(x)
+            if self.bidirectional:
+                last_output = torch.cat((h_n[-2, :, :], h_n[-1, :, :]), dim=1)
+            else:
+                last_output = h_n[-1, :, :]
+            x = self.dropout(last_output)
+            x = self.fc(x)
+            return x
 
 
-class Transformer(nn.Module):
-    """Transformer Encoder 用于时序二分类（输出 raw logits）。"""
+    class GRU(nn.Module):
+        """GRU（门控循环单元）用于时序二分类（输出 raw logits）。"""
 
-    def __init__(
-        self,
-        input_dim: int,
-        d_model: int = 64,
-        nhead: int = 4,
-        num_layers: int = 2,
-        dim_feedforward: int = 128,
-        dropout_rate: float = 0.1,
-        output_dim: int = 1,
-        max_seq_len: int = 100,
-    ):
-        super().__init__()
+        def __init__(
+            self,
+            input_dim: int,
+            hidden_dim: int = 64,
+            num_layers: int = 2,
+            output_dim: int = 1,
+            dropout_rate: float = 0.3,
+            bidirectional: bool = False,
+            batch_first: bool = True,
+        ):
+            super().__init__()
+            self.hidden_dim = hidden_dim
+            self.num_layers = num_layers
+            self.bidirectional = bidirectional
 
-        self.d_model = d_model
-        self.input_embedding = nn.Linear(input_dim, d_model)
-        self.pos_encoder = PositionalEncoding(d_model, dropout_rate, max_seq_len)
+            self.gru = nn.GRU(
+                input_size=input_dim,
+                hidden_size=hidden_dim,
+                num_layers=num_layers,
+                batch_first=batch_first,
+                dropout=dropout_rate if num_layers > 1 else 0.0,
+                bidirectional=bidirectional,
+            )
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout_rate,
-            activation="gelu",
-            batch_first=True,
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+            self.dropout = nn.Dropout(dropout_rate)
+            gru_output_dim = hidden_dim * 2 if bidirectional else hidden_dim
+            self.fc = nn.Linear(gru_output_dim, output_dim)
 
-        self.dropout = nn.Dropout(dropout_rate)
-        self.fc = nn.Linear(d_model, output_dim)
-        self._init_weights()
-
-    def _init_weights(self):
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.input_embedding(x)
-        x = self.pos_encoder(x)
-        x = self.transformer_encoder(x)
-        x = x.mean(dim=1)
-        x = self.dropout(x)
-        x = self.fc(x)
-        return x
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            _, h_n = self.gru(x)
+            if self.bidirectional:
+                last_output = torch.cat((h_n[-2, :, :], h_n[-1, :, :]), dim=1)
+            else:
+                last_output = h_n[-1, :, :]
+            x = self.dropout(last_output)
+            x = self.fc(x)
+            return x
 
 
-class PositionalEncoding(nn.Module):
-    """Transformer 位置编码。"""
+    class CNN1D(nn.Module):
+        """一维卷积神经网络（CNN）用于时序二分类（输出 raw logits）。"""
 
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 100):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
+        def __init__(
+            self,
+            input_dim: int,
+            seq_len: int,
+            num_filters: int = 64,
+            kernel_sizes: Optional[list] = None,
+            output_dim: int = 1,
+            dropout_rate: float = 0.3,
+        ):
+            super().__init__()
 
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(1, max_len, d_model)
-        pe[0, :, 0::2] = torch.sin(position * div_term)
-        pe[0, :, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe)
+            if kernel_sizes is None:
+                kernel_sizes = [2, 3, 5]
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.pe[:, :x.size(1), :]
-        return self.dropout(x)
+            self.convs = nn.ModuleList([
+                nn.Conv1d(in_channels=input_dim, out_channels=num_filters, kernel_size=k, padding=k // 2)
+                for k in kernel_sizes
+            ])
+
+            self.relu = nn.ReLU()
+            self.dropout = nn.Dropout(dropout_rate)
+
+            total_features = num_filters * len(kernel_sizes)
+            self.fc = nn.Linear(total_features, output_dim)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            x = x.transpose(1, 2)
+            conv_outputs = []
+            for conv in self.convs:
+                conv_out = self.relu(conv(x))
+                pooled = torch.max(conv_out, dim=2)[0]
+                conv_outputs.append(pooled)
+            x = torch.cat(conv_outputs, dim=1)
+            x = self.dropout(x)
+            x = self.fc(x)
+            return x
+
+
+    class Transformer(nn.Module):
+        """Transformer Encoder 用于时序二分类（输出 raw logits）。"""
+
+        def __init__(
+            self,
+            input_dim: int,
+            d_model: int = 64,
+            nhead: int = 4,
+            num_layers: int = 2,
+            dim_feedforward: int = 128,
+            dropout_rate: float = 0.1,
+            output_dim: int = 1,
+            max_seq_len: int = 100,
+        ):
+            super().__init__()
+
+            self.d_model = d_model
+            self.input_embedding = nn.Linear(input_dim, d_model)
+            self.pos_encoder = PositionalEncoding(d_model, dropout_rate, max_seq_len)
+
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout_rate,
+                activation="gelu",
+                batch_first=True,
+            )
+            self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+            self.dropout = nn.Dropout(dropout_rate)
+            self.fc = nn.Linear(d_model, output_dim)
+            self._init_weights()
+
+        def _init_weights(self):
+            for p in self.parameters():
+                if p.dim() > 1:
+                    nn.init.xavier_uniform_(p)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            x = self.input_embedding(x)
+            x = self.pos_encoder(x)
+            x = self.transformer_encoder(x)
+            x = x.mean(dim=1)
+            x = self.dropout(x)
+            x = self.fc(x)
+            return x
+
+
+    class PositionalEncoding(nn.Module):
+        """Transformer 位置编码。"""
+
+        def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 100):
+            super().__init__()
+            self.dropout = nn.Dropout(p=dropout)
+
+            position = torch.arange(max_len).unsqueeze(1)
+            div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+            pe = torch.zeros(1, max_len, d_model)
+            pe[0, :, 0::2] = torch.sin(position * div_term)
+            pe[0, :, 1::2] = torch.cos(position * div_term)
+            self.register_buffer("pe", pe)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            x = x + self.pe[:, :x.size(1), :]
+            return self.dropout(x)
+else:
+    class _TorchUnavailableModel:
+        def __init__(self, *args: Any, **kwargs: Any):
+            _require_torch("PyTorch model construction")
+
+
+    class MLP(_TorchUnavailableModel):
+        pass
+
+
+    class LSTM(_TorchUnavailableModel):
+        pass
+
+
+    class GRU(_TorchUnavailableModel):
+        pass
+
+
+    class CNN1D(_TorchUnavailableModel):
+        pass
+
+
+    class Transformer(_TorchUnavailableModel):
+        pass
+
+
+    class PositionalEncoding(_TorchUnavailableModel):
+        pass
 
 
 # =========================================================
@@ -380,6 +449,7 @@ def train_pytorch_model(
     Returns:
         训练好的模型
     """
+    _require_torch("train_pytorch_model")
     model_type = str(config.get("model_type", "mlp")).lower()
     input_dim = X_train.shape[1]
 
@@ -588,6 +658,7 @@ def predict_pytorch_model(
     Returns:
         预测概率 Series
     """
+    _require_torch("predict_pytorch_model")
     model.eval()
     X_tensor = torch.tensor(X.values, dtype=torch.float32)
 
@@ -684,6 +755,7 @@ def make_model(candidate: Dict[str, Any], seed: int) -> Any:
         return clf
 
     if model_type == "mlp":
+        _require_torch("make_model(model_type='mlp')")
         input_dim = int(model_config["input_dim"])
         hidden_dim = int(model_config["hidden_dim"])
         dropout_rate = float(model_config.get("dropout_rate", 0.5))

@@ -21,12 +21,13 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
+        cache: pip
 
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install pytest pytest-cov
+        python -m pip install -r requirements-dev.txt
+        python -m pip install pytest-cov
 
     - name: Run smoke tests
       run: |
@@ -54,7 +55,8 @@ jobs:
 
     - name: Install dependencies
       run: |
-        pip install flake8 black isort
+        python -m pip install --upgrade pip
+        python -m pip install flake8 black isort
 
     - name: Lint with flake8
       run: |
@@ -82,7 +84,8 @@ jobs:
 
     - name: Install dependencies
       run: |
-        pip install mypy types-python-dateutil
+        python -m pip install --upgrade pip
+        python -m pip install mypy types-python-dateutil
 
     - name: Run mypy
       run: |
@@ -100,10 +103,12 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
+        cache: pip
 
     - name: Install dependencies
       run: |
-        pip install -r requirements.txt
+        python -m pip install --upgrade pip
+        python -m pip install -r requirements.txt
 
     - name: Generate lock file
       run: |

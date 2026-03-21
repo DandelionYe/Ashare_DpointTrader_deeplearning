@@ -66,12 +66,14 @@ from constants import (
 )
 from feature_dpoint import build_features_and_labels, FeatureMeta
 from models import (
-    make_model, predict_dpoint, _try_import_xgboost,
+    make_model, predict_dpoint, _try_import_xgboost, TORCH_AVAILABLE,
     MLP, LSTM, GRU, CNN1D, Transformer,
     _get_device, train_pytorch_model, predict_pytorch_model,
 )
 from data_loader import walkforward_splits, final_holdout_split, walkforward_splits_with_embargo, nested_walkforward_splits
 from backtester import metric_from_fold_ratios, trade_penalty, backtest_fold_stats
+
+DL_MODEL_TYPES = {"mlp", "lstm", "gru", "cnn", "transformer"}
 
 
 # =========================================================
@@ -1514,6 +1516,16 @@ def _build_search_spaces(seed: int, input_dim: int) -> SearchSpaces:
     )
 
 
+def _has_supported_runtime(model_type: str, spaces: SearchSpaces) -> bool:
+    """检查候选模型在当前环境是否可执行。"""
+    model_type = str(model_type).lower()
+    if model_type in DL_MODEL_TYPES:
+        return TORCH_AVAILABLE
+    if model_type == "xgb":
+        return spaces.xgb_available
+    return True
+
+
 # =========================================================
 # 工具函数
 # =========================================================
@@ -2204,7 +2216,7 @@ def _sample_explore(
                 feat_cfg["use_volume"], feat_cfg["use_candle"], feat_cfg["use_turnover"]]):
         feat_cfg["use_momentum"] = True
 
-    dl_models = ["mlp", "lstm", "gru", "cnn", "transformer"]
+    dl_models = ["mlp", "lstm", "gru", "cnn", "transformer"] if TORCH_AVAILABLE else []
     mt = rng.choice(["logreg", "sgd"] + dl_models + (["xgb"] if spaces.xgb_available else []))
 
     if mt == "xgb":
@@ -2542,10 +2554,26 @@ def random_search_train(
     spaces = _build_search_spaces(seed, len(init_meta.feature_names))
 
     # --- 加载初始 incumbent ---
-    best_cfg = load_best_so_far(output_dir) or base_best_config or _sample_explore(rng, spaces, tp)
+    persisted_best_cfg = load_best_so_far(output_dir)
+    best_cfg = persisted_best_cfg or base_best_config or _sample_explore(rng, spaces, tp)
+    best_model_type = str(best_cfg.get("model_config", {}).get("model_type", "")).lower()
+    best_cfg_from_persisted = persisted_best_cfg is not None and best_cfg is persisted_best_cfg
+    if not _has_supported_runtime(best_model_type, spaces):
+        logger.warning(
+            "SEARCH incumbent model_type=%s is unsupported in the current runtime; resampling a supported fallback.",
+            best_model_type,
+        )
+        best_cfg = _sample_explore(rng, spaces, tp)
+        best_cfg_from_persisted = False
 
     # P02：加载已有 Top-K 池（跨 run 保留历史优质配置）
-    pool_items = load_best_pool(output_dir)
+    pool_items = [
+        item for item in load_best_pool(output_dir)
+        if _has_supported_runtime(
+            item.get("config", {}).get("model_config", {}).get("model_type", ""),
+            spaces,
+        )
+    ]
 
     # --- 评估初始 incumbent（P1-5：如有持久化 metric 则直接复用，跳过重复评估）---
     # （统一处理所有 DL 模型类型）
@@ -2558,7 +2586,7 @@ def random_search_train(
     # 无需再执行一次完整的 walk-forward 评估。
     # 仅当 metric 无法读取（首次运行 / base_best_config 来自外部 / 新采样）时才重新评估。
     saved_metric = load_best_so_far_metric(output_dir)
-    if saved_metric is not None and load_best_so_far(output_dir) is not None:
+    if saved_metric is not None and best_cfg_from_persisted:
         # 配置来自 best_so_far.json，metric 已有持久化值，直接复用
         best_m = float(saved_metric)
         best_eq = float(tp.get("initial_cash", 100000.0))  # equity 无持久化，用 initial_cash 占位

@@ -20,4 +20,4 @@ __pycache__/
 *.tmp
 output/
 .ipynb_checkpoints/
-.pytest_cache/
+.pytest_cache/.venv/

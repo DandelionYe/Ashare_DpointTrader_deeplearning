@@ -157,7 +157,7 @@ class TestNestedWalkforward:
         y = pd.Series(range(300))
         
         splits = nested_walkforward_splits(
-            X, y, n_outer_folds=2, n_inner_folds=2
+            X, y, n_outer_folds=2, n_inner_folds=2, min_rows=20
         )
         
         assert len(splits) > 0
